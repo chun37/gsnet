@@ -1,4 +1,4 @@
-// gsnet is the gsnet VPN control tool (tincctl-compatible CLI).
+// gsnet is the gsnet VPN control CLI.
 //
 // Usage:
 //

@@ -1,5 +1,5 @@
-// Package compression provides packet-payload compression compatible with the
-// levels tinc supports.
+// Package compression provides packet-payload compression with several
+// algorithms selectable by integer level.
 //
 // Level mapping:
 //
@@ -30,9 +30,9 @@ type Codec interface {
 	Decompress(in []byte) ([]byte, error)
 }
 
-// New returns a Codec for the given tinc-compatible level. Level 0 returns
-// a passthrough codec. Returns error for unsupported levels (10, 11) or out-
-// of-range values.
+// New returns a Codec for the given level. Level 0 returns a passthrough
+// codec. Returns error for unsupported levels (10, 11) or out-of-range
+// values.
 func New(level int) (Codec, error) {
 	switch {
 	case level == 0:

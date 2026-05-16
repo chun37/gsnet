@@ -2,7 +2,7 @@
 // gsnetd finishes the operations that require root (creating WG/VXLAN
 // interfaces, binding low ports, opening AF_PACKET sockets, etc.).
 //
-// Three levels, matching tinc's Sandbox option:
+// Three levels:
 //
 //	Off     no restrictions
 //	Normal  setuid(non-root) + chdir(confDir); kernel-network ops still possible

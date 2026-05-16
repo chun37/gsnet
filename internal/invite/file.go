@@ -13,7 +13,7 @@ import (
 //
 // The first block represents the invitee (the new node being created). Special
 // hint keys (Netname, Ifconfig, Route) are extracted from the first block and
-// used to generate tinc-up. Remaining keys are copied into the host config
+// used to generate gsnet-up. Remaining keys are copied into the host config
 // file the invitee will write for itself.
 //
 // Subsequent blocks are copied verbatim into hosts/<Name>.
@@ -33,7 +33,7 @@ type File struct {
 	Hosts   []Block
 }
 
-// ParseFile reads a tinc-style invitation file from r.
+// ParseFile reads a gsnet invitation file from r.
 //
 // Blocks are separated by lines whose first non-whitespace text begins with `#`
 // (the conventional `#---#` separator) OR by the start of a new `Name = ...`

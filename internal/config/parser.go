@@ -1,9 +1,9 @@
-// Package config parses tinc-compatible configuration files.
+// Package config parses gsnet configuration files.
 //
-// File format (tinc.conf(5)):
+// File format (gsnet.conf):
 //   - Lines of "Key = Value" or "Key Value" (the = is optional).
-//   - Keys are case-insensitive (canonicalized to Title case in known list,
-//     otherwise preserved).
+//   - Keys are case-insensitive (canonicalized to Title case in the known
+//     list, otherwise preserved).
 //   - Lines beginning with # are comments.
 //   - Multiple entries with the same key are allowed (e.g. ConnectTo).
 package config
@@ -27,7 +27,7 @@ type Entry struct {
 // Entries is a list of entries with helpers.
 type Entries []Entry
 
-// Parse reads tinc-format configuration from r.
+// Parse reads gsnet-format configuration from r.
 func Parse(r io.Reader) (Entries, error) {
 	var out Entries
 	sc := bufio.NewScanner(r)
@@ -134,7 +134,7 @@ func (es Entries) GetAll(key string) []string {
 	return out
 }
 
-// Render formats entries back to tinc.conf format.
+// Render formats entries back to gsnet.conf format.
 func (es Entries) Render() string {
 	var b strings.Builder
 	for _, e := range es {

@@ -87,7 +87,7 @@ func parseBody(s string) (Subnet, error) {
 }
 
 // parseMAC accepts both the strict net.ParseMAC form ("00:1a:...") and the
-// lenient single-digit form ("0:1a:...") that tinc allows.
+// lenient single-digit form ("0:1a:...").
 func parseMAC(s string) (net.HardwareAddr, error) {
 	if mac, err := net.ParseMAC(s); err == nil {
 		return mac, nil

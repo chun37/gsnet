@@ -1,8 +1,8 @@
 # gsnet
 
-**VXLAN on WireGuard で実装された tinc 互換 L2 VPN.**
+**VXLAN on WireGuard で実装された分散型 L2 VPN.**
 
-gsnet は [tinc](https://www.tinc-vpn.org/) の主要機能を踏襲しつつ、独自プロトコルを廃して標準的な構成要素 — WireGuard（暗号化された UDP トンネル）と VXLAN（L2 カプセル化）— の上に再構築した分散型 VPN です。
+gsnet は WireGuard（暗号化された UDP トンネル）と VXLAN（L2 カプセル化）を組み合わせた分散型 VPN です。独自のクリプトプロトコルは持たず、ピア間トポロジ情報の交換に集中したシンプルなコントロールプレーンと、kernel が処理する高速なデータプレーンを兼ね備えます。
 
 ```
 ┌─────────┐ gossip (TCP, signed JSON)      ┌─────────┐
@@ -23,7 +23,7 @@ gsnet は [tinc](https://www.tinc-vpn.org/) の主要機能を踏襲しつつ、
 | **招待制度** | URL `host:port/keyhash+cookie` + ECDH 暗号化 (X25519 + ChaCha20-Poly1305) |
 | **NAT 越え** | STUN / UPnP-IGD で reflexive アドレス取得 → gossip で公開 → WG keepalive |
 | **forwarding mode** | switch (L2 + MAC 学習) / hub (L2 ブロードキャスト) / router (L3 のみ) |
-| **互換性** | tinc の CLI (`init`, `invite`, `dump`, ...) / 設定ファイル / フック契約 (`tinc-up`, `host-up`, ...) |
+| **フック** | `gsnet-up` / `gsnet-down` / `hosts/<NAME>-up` / `subnet-up` etc. |
 | **sandbox** | setuid + chdir + Landlock (Linux 5.13+) |
 | **デバッグ** | `gsnet fsck` (設定検査), `gsnet top` (トラフィック統計), `gsnet pcap` (パケットキャプチャ) |
 
@@ -32,7 +32,6 @@ gsnet は [tinc](https://www.tinc-vpn.org/) の主要機能を踏襲しつつ、
 - **Linux 専用** (kernel WireGuard と netlink を使用)
 - **Symmetric NAT** にはリレー (TURN-like) が必要 — 未実装
 - データプレーンは kernel が担当するため、ユーザースペース圧縮は無効
-- tinc とのワイヤープロトコル互換性は **無し** (CLI / 設定 / フック契約レベルの互換のみ)
 
 ## インストール
 
@@ -78,11 +77,11 @@ gsnet -n vpn add Subnet 10.42.1.0/24
 sudo gsnetd -n vpn
 ```
 
-これで `alice` と `bob` の VXLAN インターフェース (`vxlan-vpn` 等) 経由で L2 接続が成立します。
+これで `alice` と `bob` の VXLAN インターフェース経由で L2 接続が成立します。
 
 ## 設定リファレンス
 
-`<conf-root>/<netname>/gsnet.conf` の主要キー (tinc.conf と同じ書式):
+`<conf-root>/<netname>/gsnet.conf` の主要キー (`Key = Value` 書式、`=` 省略可、case-insensitive):
 
 | キー | 既定 | 説明 |
 |---|---|---|
@@ -102,7 +101,32 @@ sudo gsnetd -n vpn
 | `Sandbox` | off | `off` / `normal` / `high` (Landlock) |
 | `User` | — | setuid 先のユーザー名 |
 
-ホスト設定 (`hosts/<name>`) は招待で自動配布されます。手動で配布する場合は `gsnet export` / `gsnet import` を使用。
+ホスト設定 (`hosts/<name>`) は招待で自動配布されます。手動配布は `gsnet export` / `gsnet import`。
+
+## フックスクリプト
+
+ConfDir に置いた以下の実行可能ファイルが、対応するイベントで同期実行されます。すべてのフックは省略可能（存在しないファイルは no-op）。
+
+| ファイル名 | 起動タイミング |
+|---|---|
+| `gsnet-up` | デーモン起動直後（VXLAN/WG インターフェースが上がった後） |
+| `gsnet-down` | デーモン停止直前 |
+| `hosts/<name>-up` | 特定ノードが到達可能になったとき |
+| `hosts/<name>-down` | 特定ノードが到達不能になったとき |
+| `host-up` / `host-down` | 任意ノードの到達性変化 |
+| `subnet-up` / `subnet-down` | サブネットの到達性変化 |
+| `invitation-created` | 招待ファイル生成直後 |
+| `invitation-accepted` | 招待が使われた直後 |
+
+環境変数: `NETNAME`, `NAME`, `DEVICE`, `INTERFACE`, `NODE`, `REMOTEADDRESS`, `REMOTEPORT`, `SUBNET`, `WEIGHT`, `INVITATION_FILE`, `INVITATION_URL`。
+
+例 (`/etc/gsnet/vpn/gsnet-up`):
+
+```sh
+#!/bin/sh
+ip addr add 10.42.0.1/16 dev $INTERFACE
+ip link set $INTERFACE up
+```
 
 ## CLI コマンド
 
@@ -151,32 +175,22 @@ stop / reload / retry / purge / pid
 
 | パッケージ | 役割 |
 |---|---|
-| `internal/subnet` | tinc 形式サブネットパース (IPv4/v6/MAC + weight) |
+| `internal/subnet` | サブネットパース (IPv4/v6/MAC + weight) |
 | `internal/keys` | Ed25519 + WireGuard 鍵管理、署名・検証、keyhash |
-| `internal/config` | tinc.conf パーサ (conf.d 対応、case-insensitive) |
+| `internal/config` | gsnet.conf パーサ (conf.d 対応、case-insensitive) |
 | `internal/invite` | 招待 URL / file / ECDH 暗号化 (X25519 + ChaCha20-Poly1305) |
 | `internal/control` | UNIX socket コントロールプロトコル |
 | `internal/graph` | ノード／エッジ／サブネット in-memory トポロジ |
 | `internal/gossip` | 安定 ID Envelope、outbox、Ed25519 署名 |
 | `internal/transport` | TCP (GOSSIP / INVITE2 多重化) |
 | `internal/dataplane` | reconciler interface + Linux 実装 (netlink/wgctrl) |
-| `internal/script` | tinc-up 等のフックランナ |
+| `internal/script` | フックスクリプトランナ |
 | `internal/daemon` | デーモン本体、orchestration |
 | `internal/stun` | RFC 5389 Binding クライアント |
 | `internal/upnp` | SSDP + IGD AddPortMapping クライアント |
 | `internal/sandbox` | setuid / chdir / Landlock |
 | `internal/pcap` | libpcap savefile writer + AF_PACKET キャプチャ |
-| `internal/compression` | zlib + lz4 (tinc 互換レベル) |
-
-## tinc との差分
-
-**互換**: CLI コマンド体系・設定ファイル形式・フックスクリプト契約・netname 別ディレクトリ構造・招待 URL 形式の見た目。
-
-**非互換**:
-- **ワイヤープロトコル**: tinc の SPTPS / legacy protocol は実装せず、WireGuard が暗号化を担う
-- **データプレーン**: tinc はユーザースペース、gsnet は kernel VXLAN
-- **PKI**: tinc は RSA + Ed25519、gsnet は Ed25519 のみ + Curve25519 (WG)
-- **招待暗号化**: tinc は ECDH ベースの独自プロトコル、gsnet は X25519 + ChaCha20-Poly1305 (詳細は別)
+| `internal/compression` | zlib + lz4 |
 
 ## 開発
 
@@ -194,7 +208,7 @@ sudo -E go test -tags netns ./internal/dataplane/linux/
 go test -v ./internal/gossip/
 ```
 
-実装は [t-wada 流 TDD](https://t-wada.hatenablog.jp/) に準拠 — `TODO.md` がテストリスト兼ロードマップ。
+実装は t-wada 流 TDD に準拠 — `TODO.md` がテストリスト兼ロードマップ。
 
 ## ライセンス
 
@@ -202,6 +216,5 @@ go test -v ./internal/gossip/
 
 ## 関連
 
-- [tinc-vpn.org](https://www.tinc-vpn.org/) — 機能の参照元
 - [WireGuard](https://www.wireguard.com/) — データプレーン暗号化
 - [Linux VXLAN documentation](https://www.kernel.org/doc/Documentation/networking/vxlan.txt)

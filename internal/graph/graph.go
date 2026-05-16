@@ -2,17 +2,17 @@
 // the subnets each node owns. It is the in-memory mirror of the gossip state.
 //
 // Edges are stored undirected: AddEdge("a","b") and AddEdge("b","a") refer to
-// the same edge. This matches tinc semantics where an edge represents
-// bidirectional reachability between two daemons.
+// the same edge — an edge represents bidirectional reachability between two
+// daemons.
 package graph
 
 import (
 	"sync"
 )
 
-// Edge represents one direction of a connection between two nodes.
-// Tinc actually requires both halves (a->b and b->a) to be announced before
-// considering an edge fully established; we store both for now.
+// Edge represents one direction of a connection between two nodes. We store
+// both halves (a->b and b->a) so the graph always reflects symmetric
+// reachability without callers having to manage the inverse explicitly.
 type Edge struct {
 	From   string
 	To     string

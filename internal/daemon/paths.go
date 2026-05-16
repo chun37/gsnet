@@ -16,7 +16,7 @@ import (
 //	    conf.d/                       optional fragments
 //	    hosts/<Name>                  per-peer host config
 //	    invitations/                  outstanding invitations
-//	    tinc-up, tinc-down, ...       hook scripts
+//	    gsnet-up, gsnet-down, ...     hook scripts
 //	    ed25519_key.priv              control-plane private key
 //	    wg.priv                       data-plane private key
 type Paths struct {

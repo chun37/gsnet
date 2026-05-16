@@ -1,6 +1,6 @@
-// Package invite handles tinc-compatible invitation URLs and files.
+// Package invite handles gsnet invitation URLs and files.
 //
-// URL format (tinc.texi "How invitations work"):
+// URL format:
 //
 //	hostname:port/<keyhash><cookie>
 //

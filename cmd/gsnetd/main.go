@@ -1,4 +1,4 @@
-// gsnetd is the gsnet VPN daemon. It is the rough equivalent of tincd.
+// gsnetd is the gsnet VPN daemon.
 //
 // Usage:
 //

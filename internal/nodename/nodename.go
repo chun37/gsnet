@@ -1,6 +1,6 @@
-// Package nodename validates and expands tinc-compatible node names.
+// Package nodename validates and expands gsnet node names.
 //
-// Tinc rules (tinc.conf(5)):
+// Rules:
 //   - Names may only contain alphanumeric characters and underscores.
 //   - Case-sensitive.
 //   - A name starting with `$` refers to the named environment variable.

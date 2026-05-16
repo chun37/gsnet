@@ -1,6 +1,7 @@
 // Package control implements the gsnet daemon's control protocol over a UNIX
-// socket. Wire format follows tinc's control protocol (see doc/CONTROL in the
-// tinc source tree):
+// socket.
+//
+// Wire format:
 //
 //   - Each message is one ASCII line terminated by '\n'.
 //   - The first token is a numeric "message class" (always 18 for normal
@@ -16,14 +17,13 @@ import (
 	"strings"
 )
 
-// MessageClass values from tinc's control_common.h.
+// Message class values used on the wire.
 const (
 	ClassGreeting = 0
 	ClassRequest  = 18
 )
 
-// RequestType numeric codes. Values match tinc's enum where it makes sense to
-// preserve wire compatibility; new gsnet-only values use the high range.
+// RequestType numeric codes.
 type RequestType int
 
 const (
@@ -119,7 +119,7 @@ func ParseGreeting(line string) (Greeting, error) {
 //
 //	<pid> <cookie>
 //
-// The cookie is what tinc/gsnet CLIs use to authenticate to the control socket.
+// The cookie is what the gsnet CLI uses to authenticate to the control socket.
 type PIDFile struct {
 	PID    int
 	Cookie string

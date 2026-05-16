@@ -12,7 +12,7 @@ import (
 
 // Init creates the initial configuration tree for a node.
 //
-// It is the gsnet equivalent of "tinc init <name>":
+// Concretely it:
 //   - Creates <NetDir>/{hosts,invitations} with mode 0700
 //   - Generates Ed25519 (control plane) and WireGuard (data plane) keypairs
 //   - Writes gsnet.conf with Name=<name>

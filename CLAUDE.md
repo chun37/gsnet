@@ -4,211 +4,103 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## プロジェクト概要
 
-**gsnet** は tinc の全機能を網羅することを目標とした L2 VPN 実装。データプレーンは **VXLAN on WireGuard**（WG トンネル上で VXLAN によりイーサネットフレームをカプセル化）で構成する。
+**gsnet** は **VXLAN on WireGuard** で実装された分散型 L2 VPN。WireGuard が UDP トンネルと暗号化を担い、VXLAN がイーサネットフレームをカプセル化、独自のゴシップ制御プレーンがピア・サブネット・トポロジ情報を Ed25519 署名付きで配布する。
 
-現状はグリーンフィールド（コードは未配置）。tinc のリファレンス実装は `/tmp/tinc/`（gsliepen/tinc を clone 済）。仕様の出典として参照すること。
+## 設計の柱
 
-## 設計指針
+### データプレーン: VXLAN on WireGuard
+- **WireGuard** がトンネル鍵交換と認証付き暗号化を担う。独自プロトコルは無い。
+- **VXLAN** が L2 フレームをカプセル化する。ブロードキャスト/マルチキャスト/ARP 含む完全な L2 接続。
+- Linux カーネルの WireGuard + VXLAN ドライバを使用 (ユーザースペース実装は無し)。
+- VXLAN は **unicast head-end replication** (FDB + 動的 MAC 学習) で動作。マルチキャスト IP は前提としない。
 
-### データプレーン：VXLAN on WireGuard
-- **WireGuard** が認証付き暗号化と鍵交換を担う。tinc独自プロトコル（SPTPS / legacy）は使わない。
-- **VXLAN** が L2 フレームをカプセル化し、ブロードキャスト/マルチキャスト/ARP を含む完全な L2 接続を提供する（tinc の switch / hub モード相当）。
-- Linux カーネルの WireGuard + VXLAN デバイスを基本とする。
-- VXLAN は **unicast head-end replication**（FDB ベース）で動作させる。マルチキャスト IP は前提としない。
+### コントロールプレーン: Ed25519 署名ゴシップ
+- TCP 接続でピア間に JSON envelope をフラッディング。
+- 各 envelope は origin の Ed25519 鍵で署名され、受信側が検証。
+- 安定 ID (`<origin>/<kind>/<key>`) + TS による dedup でメモリ有界。
+- heartbeat (30 秒) で outbox を再放送し、新規接続ピアを catch-up。
 
-### コントロールプレーン
-tinc が独自プロトコル（meta-protocol over TCP）で担っていた機能を、別途設計する必要がある。鍵交換は WG に任せ、ピア・サブネット・トポロジ情報のゴシップに専念できるので、tinc よりは単純になる。
+### 招待プロトコル: ECDH 暗号化
+- URL `host:port/<keyhash><cookie>` でブートストラップ。
+- 接続時に X25519 を交換、ChaCha20-Poly1305 で本体暗号化。
+- inviter は長期 Ed25519 鍵でエフェメラル公開鍵に署名し、URL の keyhash と一致を確認することで MITM 防止。
 
-## tinc 機能網羅リスト（実装スコープ）
+## 機能網羅マトリクス (実装済み)
 
-`/tmp/tinc/doc/` 全文と `tinc.conf.5.in` / `tinc.8.in` / `tincd.8.in` から抽出。MUST = 必須、SHOULD = 標準で実装、MAY = オプション、SKIP = WG/VXLAN で代替されるか不要。
-
-### 1. トポロジ・接続
-- **MUST** メッシュトポロジ、中央サーバなし
-- **MUST** AutoConnect（明示的 ConnectTo なしで自動的にメタ接続を張る）
-- **MUST** ConnectTo（明示的アウトバウンド接続先指定。複数可）
-- **MUST** ノードの自動再接続（バックオフ付き）。tinc は最大 15 分間隔。
-- **SHOULD** Address 複数指定（順次試行）
-- **SHOULD** LocalDiscovery（同一 LAN 内ピアの自動発見）
-- **SHOULD** IndirectData（直接通信を避け、メタ接続経由でリレー）
-- **SHOULD** DirectOnly（リレー禁止。直接届かないパケットは drop）
-- **MAY** TunnelServer（forwarding 抑制。ローカル host config に書かれたピア以外を許可しない）
-- **MAY** StrictSubnets（ローカル host config の Subnet のみ受け入れる）
-- **MAY** MaxConnectionBurst（短時間の接続数制限）
-- **MAY** MaxTimeout（再接続最大待ち）
-- **SKIP** TCPOnly（WG は UDP のみ。TCP fallback が必要なら別途検討）
-
-### 2. ルーティング・転送モード
-- **MUST** switch モード（MAC 学習による L2 スイッチング）— gsnet の主目的
-- **MUST** ADD_EDGE / DEL_EDGE 相当のグラフ同期
-- **MUST** ADD_SUBNET / DEL_SUBNET 相当のサブネット所有権伝搬
-- **MUST** Subnet 宣言（IPv4 / IPv6 / MAC、prefix 長、weight による優先度）
-- **MUST** BroadcastSubnet（サブネットブロードキャストアドレスの宣言）
-- **MUST** Broadcast モード（no / mst / direct）— L2 では mst 相当が必須
-- **SHOULD** hub モード（全パケットを全ピアへブロードキャスト）
-- **SHOULD** router モード（IPv4/IPv6 のみ、Subnet による L3 ルーティング）
-- **MAY** DecrementTTL（中継時の TTL 減算）
-- **MAY** Forwarding = off | internal | kernel（中継方式の切替）
-- **MAY** PriorityInheritance（内部 IPv4 ToS を外側 UDP にコピー）
-- **MAY** ClampMSS（TCP MSS クランプ。PMTU ブラックホール対策）
-
-### 3. ピア発見・参加
-- **MUST** invitation 機構（`tinc invite` / `tinc join`）。短い URL（`host:port/keyhash+cookie`）でブートストラップ。
-- **MUST** invitation URL の検証（keyhash で MITM 防止）
-- **MUST** invitation file 形式（Name / Netname / ConnectTo + host config ブロック）
-- **MUST** Ifconfig ヒント（招待ファイル内に IP / netmask / dhcp / dhcp6 / slaac / MAC を埋め込み、`tinc-up` を自動生成）
-- **MUST** Route ヒント（招待ファイル内に IPv4/IPv6 ルートを埋め込み）
-- **MUST** InvitationExpire（既定 604800 秒）
-- **MUST** export / export-all / import / exchange / exchange-all（host config の手動配布）
-- **MUST** invitation-created / invitation-accepted フック
-
-### 4. 暗号・認証
-- **MUST** ノード PKI（公開鍵で identity を表現、相互認証）
-- **MUST** 鍵生成（gsnet では WG キーペア + 制御プレーン用 Ed25519 が妥当）
-- **MUST** sign / verify（任意ファイルをノード鍵で署名・検証）
-- **MUST** ReplayWindow（リプレイ防止ウィンドウ）— WG が担う
-- **MUST** KeyExpire / 鍵ローテーション — WG の rekey が担う
-- **SKIP** Cipher / Digest / MACLength 選択（WG の単一スイートで固定）
-- **SKIP** PrivateKeyFile / Ed25519PrivateKeyFile / ExperimentalProtocol / SPTPS（独自プロトコル不要）
-
-### 5. NAT 越え・トランスポート
-- **MUST** UDP hole punching（WG の `Endpoint` 動的更新で実現）
-- **MUST** UDPDiscovery 相当の到達性チェック（WG handshake / keepalive で代替可）
-- **MUST** UDPDiscoveryKeepaliveInterval / UDPDiscoveryInterval / UDPDiscoveryTimeout（WG の PersistentKeepalive と独自プローブで代替）
-- **MUST** UDPInfoInterval（外側エンドポイント情報の伝搬）
-- **SHOULD** UPnP / UPnP-IGD（NAT ルーターでのポートマッピング）
-- **SHOULD** STUN 等の外部 reflexive アドレス取得（tinc は持たないが NAT 越えを真面目にやるなら必要）
-- **MAY** Proxy（socks4 / socks5 / http / exec）— WG では使えないため SKIP の候補
-- **MAY** FWMark（Linux: ソケットの fwmark）
-
-### 6. MTU / PMTU
-- **MUST** PMTU Discovery（ピアごと）
-- **MUST** PMTU の VPN 内強制（path MTU 以下に制限）
-- **MUST** MTUInfoInterval（リレー path MTU の更新）
-- **MUST** PMTU 既定値（tinc は 1514）
-
-### 7. ネットワークインターフェース
-- **MUST** tap デバイス相当の L2 NIC を作成・破棄（VXLAN デバイスがその役割）
-- **MUST** Interface 名指定
-- **MUST** DeviceStandby（到達可能ピアがある時のみ if up）
-- **SHOULD** Device / DeviceType の抽象化（dummy / fd / etc.）
-
-### 8. スクリプト・フック
-スクリプト名 / 引数 / 環境変数は tinc と互換にする（既存ユーザのスクリプト流用を可能に）。
-- **MUST** `tinc-up` / `tinc-down`
-- **MUST** `hosts/<HOST>-up` / `hosts/<HOST>-down`（特定ノードの到達性変化）
-- **MUST** `host-up` / `host-down`（任意ノードの到達性変化）
-- **MUST** `subnet-up` / `subnet-down`（サブネット到達性変化）
-- **MUST** `invitation-created` / `invitation-accepted`
-- **MUST** 環境変数: `NETNAME`, `NAME`, `DEVICE`, `INTERFACE`, `NODE`, `REMOTEADDRESS`, `REMOTEPORT`, `SUBNET`, `WEIGHT`, `INVITATION_FILE`, `INVITATION_URL`
-- **SHOULD** ScriptsExtension / ScriptsInterpreter
-
-### 9. CLI / 制御
-`tincctl` 互換コマンドを CLI として提供する。
-- **MUST** `init [name]` — 設定とキーペア生成
-- **MUST** `start` / `stop` / `restart` / `reload` — デーモン操作
-- **MUST** `get` / `set` / `add` / `del` / `edit` — 設定変数操作（`host.variable` 表記対応）
-- **MUST** `invite <name>` / `join [URL]`
-- **MUST** `export` / `export-all` / `import` / `exchange` / `exchange-all`
-- **MUST** `generate-keys` / `generate-ed25519-keys` / `generate-rsa-keys`（互換のため空打ち可とするか要検討）
-- **MUST** `dump nodes` / `dump reachable nodes` / `dump edges` / `dump subnets` / `dump connections` / `dump graph|digraph` / `dump invitations`
-- **MUST** `info <node|subnet|address>`
-- **MUST** `purge`（unreachable ノードの情報破棄）
-- **MUST** `retry` — 即時再接続試行
-- **MUST** `disconnect <node>`
-- **MUST** `debug <N>` / `log [N]`
-- **MUST** `pid`
-- **MUST** `pcap` — VPN トラフィックを pcap 形式で標準出力へ
-- **MUST** `top` — curses 風ライブ統計（s/c/n/i/I/o/O/t/T/b/k/M/G/q キーバインド）
-- **MUST** `fsck` — 設定検査と自動修正提案
-- **MUST** `sign` / `verify`
-- **MUST** `network [netname]` — netname 切替・一覧
-- **MUST** インタラクティブシェル（readline、`#` コメント、パイプ入力対応）
-- **MUST** `-n NETNAME` で複数 VPN 同居（設定ディレクトリ分離）
-- **MAY** `-b/--batch` / `--force` / `--pidfile` / `--config`
-
-### 10. 制御ソケットプロトコル
-- **MUST** UNIX socket リスナ（PID ファイル内のクッキーで認証）
-- **MUST** REQ_STOP / DUMP_NODES / DUMP_EDGES / DUMP_SUBNETS / DUMP_CONNECTIONS / DUMP_TRAFFIC / DUMP_INVITATIONS
-- **MUST** REQ_PURGE / SET_DEBUG / RETRY / RELOAD / DISCONNECT / PCAP / LOG
-- 詳細フォーマットは `/tmp/tinc/doc/CONTROL` 参照（互換性を保つ場合）
-
-### 11. デーモン運用
-- **MUST** `-D/--no-detach`, `-d/--debug[=N]`, `-s/--syslog`, `--logfile[=FILE]`
-- **MUST** SIGHUP で reload、SIGALRM で `retry` 相当
-- **MUST** デバッグレベル 0–5（接続 / プロトコル / メタソケット / VPN トラフィック）
-- **SHOULD** `-L/--mlock`（鍵を swap に書かない）
-- **SHOULD** `-R/--chroot` / `-U/--user`（権限分離）
-- **SHOULD** Sandbox（off / normal / high）— Linux なら seccomp / Landlock 相当
-- **MAY** AddressFamily（ipv4 / ipv6 / any）
-- **MAY** BindToAddress / BindToInterface / ListenAddress / Port（複数 Listen）
-- **MAY** UDPRcvBuf / UDPSndBuf / IffOneQueue
-- **MAY** ProcessPriority（low / normal / high）
-- **MAY** Hostnames（DNS 逆引き）
-- **MAY** PingInterval / PingTimeout
-- **SKIP** `--bypass-security`
-
-### 12. 設定ファイル
-- **MUST** netname ごとの設定ディレクトリ（`<confdir>/<NETNAME>/`）
-- **MUST** `tinc.conf`、`hosts/<NAME>`
-- **MUST** `conf.d/` 配下の追加ファイル読み込み
-- **MUST** 設定変数の case-insensitive
-- **MUST** `Name` 環境変数置換（`$HOST` 等）
-- **MUST** `invitations/`, `invitation-data` の管理
-
-### 13. 圧縮
-- **MAY** Compression レベル（0=off, 1–9=zlib, 10–11=lzo, 12=lz4）。WG / VXLAN は標準で持たないため、データプレーンに追加処理を入れることになる。既定は無効。
+| カテゴリ | 機能 | 状態 |
+|---|---|---|
+| **トポロジ** | メッシュ + ConnectTo + 自動再接続 (exponential backoff) | ✅ |
+| **転送モード** | switch (MAC 学習) / hub / router | ✅ |
+| **ピア発見** | invitation URL + ECDH 暗号化交換 / export-import | ✅ |
+| **暗号** | Ed25519 (ノード ID) + WireGuard (X25519) + ChaCha20-Poly1305 | ✅ |
+| **NAT 越え** | STUN + UPnP-IGD で reflexive アドレス取得、gossip 公開 | ✅ |
+| **PMTU** | WG の組み込み path MTU 探索を利用 (MTU 設定可) | ✅ |
+| **NIC** | VXLAN デバイス自動作成・破棄 | ✅ |
+| **スクリプト** | gsnet-up / gsnet-down / hosts/<NAME>-up/-down 等 | フックランナ完成、未配線フック有 |
+| **CLI** | init/get/set/add/del/invite/join/dump/export/import/fsck/pcap/top/stop/reload/retry/purge/pid | ✅ |
+| **制御ソケット** | UNIX socket + cookie 認証、REQ_* 一式 | ✅ |
+| **デーモン運用** | フラグ + SIGHUP reload + SIGALRM retry | ✅ |
+| **設定ファイル** | gsnet.conf + conf.d/ + hosts/<NAME>、case-insensitive | ✅ |
+| **圧縮** | zlib + lz4 ライブラリ実装済み (データプレーン未統合: kernel VXLAN のため) | 部分 |
+| **Sandbox** | setuid + chdir + Landlock (Linux 5.13+) | ✅ |
 
 ## アーキテクチャの「大きな絵」
 
-実装は以下のレイヤに分離する：
+実装は以下のレイヤに分離されている:
 
-1. **設定 / 状態ストア** — ノード ID、公開鍵、宣言サブネット、エンドポイント候補、招待のローカル DB（tinc の `tinc.conf` + `hosts/` + `invitations/` 相当）
-2. **コントロールプレーン** — ピア間でゴシップ（ADD_EDGE/SUBNET 相当の伝搬、グラフ同期、招待引き換え）
+1. **設定 / 状態ストア** — ノード ID、公開鍵、宣言サブネット、エンドポイント候補、招待のローカル DB (`gsnet.conf` + `hosts/` + `invitations/`)
+2. **コントロールプレーン** — ピア間でゴシップ (ADD_EDGE/SUBNET 等の伝搬、グラフ同期、招待引き換え)
 3. **データプレーン reconciler** — 1/2 の望ましい状態から、WG インターフェース・ピア、VXLAN デバイス、FDB エントリ、ルーティングテーブルを netlink で宣言的に整合させる
-4. **CLI / 制御ソケット** — `tincctl` 互換コマンドと UNIX socket API
-5. **スクリプトランナ** — `tinc-up` 等のフック実行と環境変数注入
+4. **CLI / 制御ソケット** — `gsnet` コマンドと UNIX socket API
+5. **スクリプトランナ** — `gsnet-up` 等のフック実行と環境変数注入
 
-データプレーンは **観測 → 望ましい状態と差分計算 → 適用** の reconcile ループにする。tinc の手続き的再接続ロジックよりも理解しやすい。
+データプレーンは **観測 → 望ましい状態と差分計算 → 適用** の reconcile ループ。手続き的な再接続ロジックよりも理解しやすい。
+
+## パッケージ構成
+
+| パッケージ | 役割 |
+|---|---|
+| `internal/subnet` | サブネットパース (IPv4/v6/MAC + weight) |
+| `internal/nodename` | ノード名バリデーションと `$ENV` 展開 |
+| `internal/keys` | Ed25519 / WireGuard 鍵、PEM / base64、sign/verify、Hash() |
+| `internal/config` | `gsnet.conf` / `hosts/<NAME>` パーサ (conf.d 対応) |
+| `internal/invite` | 招待 URL (`host:port/keyhash+cookie`)、invitation file、X25519 ECDH crypto |
+| `internal/control` | UNIX socket プロトコル、PID ファイル、サーバ／クライアント |
+| `internal/graph` | ノード／エッジ／サブネットの in-memory トポロジ |
+| `internal/gossip` | Envelope (JSON + Ed25519 署名)、安定 ID、TS dedup、outbox |
+| `internal/transport` | TCP (GOSSIP + INVITE2 多重化)、Dial 重複検出 |
+| `internal/dataplane` | reconciler interface + TrafficStats reporter |
+| `internal/dataplane/fake` | テスト用 in-memory 実装 |
+| `internal/dataplane/linux` | netlink + wgctrl の本番実装 (WG / VXLAN / FDB) |
+| `internal/script` | フックランナと環境変数注入 |
+| `internal/stun` | RFC 5389 Binding クライアント |
+| `internal/upnp` | SSDP + IGD クライアント (AddPortMapping / DeletePortMapping / GetExternalIPAddress) |
+| `internal/sandbox` | setuid + chdir + Landlock (Sandbox=high) |
+| `internal/pcap` | libpcap savefile writer + AF_PACKET キャプチャ |
+| `internal/compression` | zlib + lz4 codec |
+| `internal/daemon` | `Init()`、Daemon ループ、reload / シグナル、orchestration、NAT discovery |
+| `cmd/gsnetd` | デーモン本体 (`--fake` で root 不要のドライラン) |
+| `cmd/gsnet` | CLI (init/get/set/add/del/invite/dump/...) |
 
 ## 開発メモ
 
 - 実装言語: **Go** (`wgctrl-go` + `vishvananda/netlink`)
 - TDD は t-wada 流。Red → Green → Refactor を細かく回す。テストリストは `TODO.md`。
-- 検証は netns で複数ノードを模擬予定。物理ホスト不要。
-- tinc 互換性のテストは、`tinc invite` ↔ `gsnet join` のような相互運用ではなく、CLI / 設定ファイル / フック契約レベルの互換に絞る（プロトコルは別物）。
-
-## 現状（実装済み）
-
-| パッケージ | 役割 |
-|---|---|
-| `internal/subnet` | tinc 形式サブネット（IPv4/v6/MAC + weight）パース |
-| `internal/nodename` | ノード名バリデーションと `$ENV` 展開 |
-| `internal/keys` | Ed25519 / WireGuard 鍵、PEM / base64、sign/verify、Hash() |
-| `internal/config` | `gsnet.conf` / `hosts/<NAME>` パーサ（conf.d 対応） |
-| `internal/invite` | 招待 URL（`host:port/keyhash+cookie`）と invitation file |
-| `internal/control` | UNIX socket プロトコル、PID ファイル、サーバ／クライアント |
-| `internal/graph` | ノード／エッジ／サブネットの in-memory トポロジ |
-| `internal/gossip` | Envelope（JSON + Ed25519 署名）、loop 抑止、Plane（Announce/Receive） |
-| `internal/transport` | TCP gossip + invite を多重化したノード間トランスポート |
-| `internal/dataplane` | reconciler interface |
-| `internal/dataplane/fake` | テスト用 in-memory 実装 |
-| `internal/dataplane/linux` | netlink + wgctrl の本番実装（WG / VXLAN / FDB） |
-| `internal/script` | tinc-up 等のフックランナと環境変数注入 |
-| `internal/daemon` | `Init()`、Daemon ループ、reload/シグナル、コントロールハンドラ |
-| `cmd/gsnetd` | デーモン本体（`--fake` で root 不要のドライラン） |
-| `cmd/gsnet` | tincctl 互換 CLI（init/get/set/add/del/invite/dump/...） |
+- 検証は netns で複数ノードを模擬可能 (`go test -tags netns`、root 必須)。
+- 単体テストはすべて非特権で実行可能。fake reconciler で daemon 全体の挙動も検証できる。
 
 ## ビルド・実行
 
 ```sh
 # テスト
 go test ./...
+go test -race ./...                                 # レース検出
+sudo -E go test -tags netns ./internal/dataplane/linux/  # kernel 統合 (root)
 
-# ビルド（バイナリは $GOBIN へ）
+# ビルド (バイナリは $GOBIN へ)
 go install ./cmd/gsnet ./cmd/gsnetd
 
-# ドライラン（root 不要、fake reconciler）
+# ドライラン (root 不要、fake reconciler)
 mkdir -p /tmp/gsnet-test/run
 gsnet -n vpn -c /tmp/gsnet-test init alice
 gsnet -n vpn -c /tmp/gsnet-test add Subnet 10.42.0.0/16
@@ -216,18 +108,22 @@ gsnetd -n vpn -c /tmp/gsnet-test -r /tmp/gsnet-test/run --fake &
 gsnet -n vpn -c /tmp/gsnet-test -r /tmp/gsnet-test/run dump subnets
 gsnet -n vpn -c /tmp/gsnet-test -r /tmp/gsnet-test/run stop
 
-# 本番（root 必要、Linux のみ）
+# 本番 (root 必要、Linux のみ)
 sudo gsnetd -n vpn
 ```
 
-## 未実装（次に着手すべき領域）
-
-`TODO.md` の Phase 11 残課題セクション参照。主な機能は揃っており、残るのは:
-- **netns 統合テスト**: 実 kernel での WG+VXLAN+FDB 動作確認（root 必須）
-- **STUN / hole punching**: NAT 越え
-
 ## 重要な実装メモ
 
-- **gossip envelope は安定 ID**: 同じ事実は同じ ID を持つ。`<origin>/<kind>/<key>`。dedup は TS 比較で、新しい TS が古いものを上書き。heartbeat は outbox を再放送するだけなのでメモリは有界。
-- **invitation は ECDH 暗号化**: `INVITE2 GET/JOIN` プロトコル。X25519 で鍵共有、ChaCha20-Poly1305 で本体暗号化、Ed25519 で inviter 認証。URL の keyhash が MITM 検出キー。
-- **VXLAN は Learning=true**: 動的 MAC 学習は kernel が担当。reconciler は broadcast MAC エントリ（head-end replication）のみ管理する。
+- **gossip envelope は安定 ID**: 同じ事実は同じ ID。`<origin>/<kind>/<key>`。dedup は TS 比較で、新しい TS が古いものを上書き。heartbeat は outbox を再放送するだけなのでメモリは事実数で有界。
+- **invitation は ECDH 暗号化**: `INVITE2 GET/JOIN` プロトコル。X25519 鍵共有、ChaCha20-Poly1305 で本体暗号化、Ed25519 で inviter 認証。URL の keyhash が MITM 検出キー。
+- **VXLAN は Learning=true (switch モード)**: 動的 MAC 学習は kernel が担当。reconciler は broadcast MAC エントリ (head-end replication) のみ管理し、kernel-learned エントリには触れない。hub モードでは Learning=false。
+- **NAT 越え**: 各ノードが STUN/UPnP で reflexive アドレスを発見 → gossip Hello で公開 → 全ピアの WG ピア設定が更新 → PersistentKeepalive (25 秒) が両側の NAT pinhole を開く。symmetric NAT 用のリレーは未実装。
+- **Plane の競合修正**: `Receive` は verify → claim (CAS) → apply → Broadcast の順。`claim` は TS 比較を 1 つの critical section で行うため、並行受信での二重 apply が起きない。
+- **Transport.Dial は冪等**: 既存接続が同じ outbound アドレスを持つなら no-op。`maintainPeer` の周期再 Dial で接続数が無限増加することを防ぐ。
+
+## 未実装
+
+`TODO.md` 参照。主要機能は揃っており、残るのは:
+- **Symmetric NAT 用リレー** (TURN-like)
+- **seccomp-bpf** によるシステムコールフィルタ
+- **IPv6 STUN XOR-MAPPED-ADDRESS** デコード

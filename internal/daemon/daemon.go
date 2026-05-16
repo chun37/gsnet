@@ -119,7 +119,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.logger().Printf("initial reconcile: %v", err)
 	}
 	if err := d.runUp(ctx); err != nil {
-		d.logger().Printf("tinc-up: %v", err)
+		d.logger().Printf("gsnet-up: %v", err)
 	}
 
 	cookie, err := control.NewCookie()
@@ -163,7 +163,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	err = srv.Serve(subCtx)
 	_ = d.tport.Close()
 	if rdErr := d.runDown(); rdErr != nil {
-		d.logger().Printf("tinc-down: %v", rdErr)
+		d.logger().Printf("gsnet-down: %v", rdErr)
 	}
 	if shErr := d.Reconciler.Shutdown(); shErr != nil {
 		d.logger().Printf("reconciler shutdown: %v", shErr)
@@ -667,14 +667,14 @@ func (d *Daemon) heartbeat(ctx context.Context) {
 
 func (d *Daemon) runUp(ctx context.Context) error {
 	r := &script.Runner{ConfDir: d.Paths.NetDir()}
-	return r.Run(ctx, "tinc-up", d.scriptEnv())
+	return r.Run(ctx, "gsnet-up", d.scriptEnv())
 }
 
 func (d *Daemon) runDown() error {
 	r := &script.Runner{ConfDir: d.Paths.NetDir()}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return r.Run(ctx, "tinc-down", d.scriptEnv())
+	return r.Run(ctx, "gsnet-down", d.scriptEnv())
 }
 
 func (d *Daemon) scriptEnv() script.Env {

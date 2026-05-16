@@ -1,5 +1,6 @@
-// Package script runs tinc-compatible hook scripts (tinc-up, tinc-down,
-// hosts/<NAME>-up, etc.) with the same environment variable contract as tinc.
+// Package script runs gsnet hook scripts (gsnet-up, gsnet-down,
+// hosts/<NAME>-up, etc.) with a fixed environment-variable contract that
+// scripts can rely on.
 package script
 
 import (
@@ -27,7 +28,7 @@ type Env struct {
 	InvitationURL  string
 }
 
-// ToOSEnv returns the merged os.Environ() + tinc-style variables.
+// ToOSEnv returns the process environment merged with the gsnet hook variables.
 func (e Env) ToOSEnv() []string {
 	out := os.Environ()
 	add := func(k, v string) {
@@ -51,7 +52,7 @@ func (e Env) ToOSEnv() []string {
 
 // Runner executes hook scripts from a config directory.
 type Runner struct {
-	// ConfDir is the per-netname config root (where tinc-up lives).
+	// ConfDir is the per-netname config root (where gsnet-up lives).
 	ConfDir string
 	// Extension is appended to the script name (e.g. ".py").
 	Extension string
@@ -59,7 +60,7 @@ type Runner struct {
 	Interpreter string
 }
 
-// Run executes the script named name (e.g. "tinc-up", "hosts/alice-up") if it
+// Run executes the script named name (e.g. "gsnet-up", "hosts/alice-up") if it
 // exists and is executable. Missing scripts are a no-op; non-zero exits return
 // an error with the script's combined output.
 func (r *Runner) Run(ctx context.Context, name string, env Env) error {

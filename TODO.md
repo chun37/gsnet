@@ -31,7 +31,7 @@
 - [x] 公開鍵 SHA-256 ハッシュ（invitation URL 用 keyhash）
 - [x] sign / verify
 
-## Phase 3: tinc.conf パーサ ✅ DONE
+## Phase 3: gsnet.conf パーサ ✅ DONE
 
 - [x] `Variable = Value` 形式（`=` 省略可、case-insensitive、コメント）
 - [x] 複数同名変数（ConnectTo 等）の保持
@@ -88,7 +88,7 @@
 - [x] dataplane reconcile（OnMessage で再 reconcile）
 - [x] コントロールソケットでのハンドラ
 - [x] SIGHUP で reload、SIGALRM で retry、SIGINT/SIGTERM で停止
-- [x] tinc-up / tinc-down フックの実行
+- [x] gsnet-up / gsnet-down フックの実行
 - [x] PID ファイル + control socket のライフサイクル
 
 ## Phase 10: Cross-node transport ✅ DONE
@@ -113,7 +113,7 @@
 - [x] **hub モード**: VXLAN `Learning=false` で実装。`Mode = hub` で有効化
 - [x] **router モード**: VXLAN を作らず、各ピアの宣言サブネットを WG `AllowedIPs` に展開。`Mode = router`
 - [x] **top コマンド (テキスト版)**: `REQ_DUMP_TRAFFIC` 経由で per-peer の WG カウンタを表示。`gsnet top -i 1`
-- [x] **Compression API**: zlib (level 1-9) + lz4 (level 12) を tinc 互換ナンバリングで実装
+- [x] **Compression API**: zlib (level 1-9) + lz4 (level 12) を `internal/compression` で実装
 - [x] **STUN クライアント**: RFC 5389 Binding Request で reflexive アドレス取得 (`internal/stun`)
 - [x] **UPnP-IGD**: SSDP M-SEARCH + AddPortMapping/DeletePortMapping (`internal/upnp`)
 - [x] **Sandbox (Linux)**: `Sandbox` / `User` 設定で setuid + chdir。Landlock は API 不安定のため省略
