@@ -212,7 +212,7 @@ go test -v ./internal/gossip/
 
 ## ライセンス
 
-未指定 (将来 BSD-2-Clause か MIT を想定)。
+[MIT License](LICENSE) (c) 2026 chun37
 
 ## 関連
 
