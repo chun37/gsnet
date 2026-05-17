@@ -170,6 +170,21 @@ func (r *Reconciler) ensureWGInterface(s dataplane.State) error {
 }
 
 func (r *Reconciler) configureWGPeers(s dataplane.State) error {
+	// We want a single ConfigureDevice call that:
+	//   - adds new peers,
+	//   - updates existing peers' AllowedIPs / endpoint,
+	//   - removes peers that disappeared from desired state.
+	// We must NOT use ReplacePeers=true unconditionally: that removes every
+	// peer first and re-adds them, which destroys the kernel WG session state
+	// (handshake, replay counter) every time we reconcile. With gsnet's
+	// reconcile-on-every-gossip-envelope cadence that means a fresh handshake
+	// on every heartbeat — and during the handshake window data packets get
+	// dropped, looking like flaky/intermittent connectivity.
+	desired := make(map[wgtypes.Key]dataplane.Peer, len(s.Peers))
+	for _, p := range s.Peers {
+		desired[p.WGPublic] = p
+	}
+
 	peers := make([]wgtypes.PeerConfig, 0, len(s.Peers))
 	for _, p := range s.Peers {
 		pc := wgtypes.PeerConfig{
@@ -189,11 +204,25 @@ func (r *Reconciler) configureWGPeers(s dataplane.State) error {
 		pc.PersistentKeepaliveInterval = &ka
 		peers = append(peers, pc)
 	}
+
+	// Generate Remove entries for any peer currently on the device that's no
+	// longer in `desired`.
+	if dev, err := r.wg.Device(s.WGInterface); err == nil {
+		for _, existing := range dev.Peers {
+			if _, keep := desired[existing.PublicKey]; keep {
+				continue
+			}
+			peers = append(peers, wgtypes.PeerConfig{
+				PublicKey: existing.PublicKey,
+				Remove:    true,
+			})
+		}
+	}
+
 	cfg := wgtypes.Config{
-		PrivateKey:   &s.WGPrivate,
-		ListenPort:   intp(s.WGListenPort),
-		ReplacePeers: true,
-		Peers:        peers,
+		PrivateKey: &s.WGPrivate,
+		ListenPort: intp(s.WGListenPort),
+		Peers:      peers,
 	}
 	return r.wg.ConfigureDevice(s.WGInterface, cfg)
 }
