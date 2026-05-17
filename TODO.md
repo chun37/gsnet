@@ -125,6 +125,18 @@
 - [x] **NAT 越え (cone NAT)**: gossip で endpoint を伝搬 → 各ピアの WG が当該 endpoint に PersistentKeepalive (25s) を送る → 双方の NAT に pinhole が開く。
 - [x] **Landlock filesystem confinement**: `Sandbox = high` で有効。`landlock_create_ruleset` / `_add_rule` / `_restrict_self` を直接 syscall。ConfDir read-only、RunDir/InvitationsDir read-write、その他全 deny。Linux 5.13+ で動作、それ以前は明示的なエラー。
 
+## Phase 14: データプレーン安定化 (PR #2) ✅ DONE
+
+二ノード実機での導通検証で発覚したバグ群と、それに伴う設計修正。
+
+- [x] **オーバーレイ/アンダーレイ分離**: 旧実装は `InnerAddress` を VXLAN デバイスと FDB 宛先の両方に使い、kernel の `vxlan_get_route()` が circular route を検出して `-ELOOP` で全 encap を drop していた。`UnderlayAddress` を導入し、WG インターフェース + VXLAN encap source + FDB 宛先を別アドレス空間に。switch/hub モードでは `UnderlayAddress` 必須 (起動時に reconciler が拒否)。
+- [x] **FDB family 修正**: `reconcileFDB` の `netlink.Neigh` を `FAMILY_ALL` (=`AF_UNSPEC`) から `syscall.AF_BRIDGE` に。前者では L3 neighbor table に積まれて bridge FDB に登録されず、`bridge fdb show` が空という silent bug。
+- [x] **WG セッション維持**: `ConfigureDevice` の `ReplacePeers=true` を撤廃し、existing-peers との差分から `Remove=true` を立てる方式に。30 秒 heartbeat 毎にハンドシェイクをやり直す問題を解消。
+- [x] **決定論的 VXLAN MAC + ピア MAC FDB**: `vxlanMACFromKey(pub)` = `sha256(pub)[:6]` (local-admin ON / multicast OFF)。`reconcileFDB` がブロードキャスト MAC とピア MAC の 2 種を pre-install するので kernel 動的 MAC 学習に依存しない。
+- [x] **MTU を毎 reconcile 反映**: `LinkSetMTU` を WG / VXLAN 両方に。`gsnet.conf` の `MTU` 変更が SIGHUP で効くように。既定は 1420 (旧 1450 は 1500-byte underlay LAN でオーバーフロー)。
+- [x] **VXLAN SrcAddr drift の再作成**: `UnderlayAddress` を変えて reload した場合、kernel が SrcAddr 変更 API を持たないので `LinkDel` → 再作成。reconciler が再 install するので副作用なし。
+- [x] **gossip Hello に Inner/UnderlayAddr 追加**: 招待・export/import 経路だけでは invitee 側が inviter の overlay/underlay を知れなかったため、`Hello` 経由で fan-out。`Plane` に `InnerAddrOf` / `UnderlayAddrOf` (`netip.Addr`)、`KindDelNode` で per-origin state を purge。`buildState` は gossip-learned > `hosts/<peer>` の順で解決。
+
 ## 残課題（さらに先 — もう仕様の範囲外）
 
 - [ ] Symmetric NAT への対処（リレー TURN-like サーバが必要）

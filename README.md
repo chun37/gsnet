@@ -5,12 +5,15 @@
 gsnet は WireGuard（暗号化された UDP トンネル）と VXLAN（L2 カプセル化）を組み合わせた分散型 VPN です。独自のクリプトプロトコルは持たず、ピア間トポロジ情報の交換に集中したシンプルなコントロールプレーンと、kernel が処理する高速なデータプレーンを兼ね備えます。
 
 ```
-┌─────────┐ gossip (TCP, signed JSON)      ┌─────────┐
-│  alice  │ ◄─────────────────────────────► │   bob   │
-│         │ VXLAN frames over WireGuard UDP │         │
-│  10.42.0.1     ─────────────────────►     10.42.0.2 │
-└─────────┘                                  └─────────┘
+┌─────────┐ gossip (TCP, signed JSON)        ┌─────────┐
+│  alice  │ ◄───────────────────────────────► │   bob   │
+│         │ VXLAN(overlay) over WireGuard UDP │         │
+│ overlay 10.42.0.1   ◄────────────────►   10.42.0.2    │
+│ underlay 172.16.0.1 ◄── WG tunnel ───► 172.16.0.2     │
+└─────────┘                                   └─────────┘
 ```
+
+オーバーレイ (VXLAN 上の L2) と WG アンダーレイ (UDP-4789 を運ぶ IP 層) は別のアドレス空間。これによりカーネルの `vxlan_get_route` が経路ループを起こさず、純粋な L2 接続を提供できる。
 
 ## 特徴
 
@@ -53,7 +56,8 @@ go install ./cmd/gsnet ./cmd/gsnetd
 gsnet -n vpn init alice
 gsnet -n vpn set Address vpn.example.com
 gsnet -n vpn set Port 51820
-gsnet -n vpn set InnerAddress 10.42.0.1
+gsnet -n vpn set InnerAddress    10.42.0.1/16    # VXLAN オーバーレイ上のアドレス
+gsnet -n vpn set UnderlayAddress 172.16.0.1/24   # WG 内の自分の IP (VXLAN encap source)
 gsnet -n vpn add Subnet 10.42.0.0/16
 
 # デーモン起動 (root 必要 — WG + VXLAN 作成のため)
@@ -70,14 +74,17 @@ gsnet -n vpn invite bob
 # URL から自動セットアップ (鍵生成 + 設定 + hosts/* の書き出し)
 gsnet -c /etc/gsnet join 'vpn.example.com:51820/kJ4M9...XVw'
 
-# 自分側の VPN 内アドレスとサブネットを追加
-gsnet -n vpn set InnerAddress 10.42.0.2
+# 自分側のアドレスとサブネットを追加
+gsnet -n vpn set InnerAddress    10.42.0.2/16
+gsnet -n vpn set UnderlayAddress 172.16.0.2/24
 gsnet -n vpn add Subnet 10.42.1.0/24
 
 sudo gsnetd -n vpn
 ```
 
-これで `alice` と `bob` の VXLAN インターフェース経由で L2 接続が成立します。
+これで `alice` と `bob` の VXLAN インターフェース経由で L2 接続が成立します。アドレスは gossip Hello で自動配布されるので、ピアの `hosts/<peer>` を手動で同期する必要はありません。
+
+> **switch/hub モードでは `UnderlayAddress` が必須**です。これを設定しないと `gsnetd` が `LocalUnderlayAddr is required for switch/hub mode` で起動を拒否します。`router` モードでは不要。
 
 ## 設定リファレンス
 
@@ -88,13 +95,14 @@ sudo gsnetd -n vpn
 | `Name` | — | ノード名 (英数字 + `_`、必須) |
 | `Address` | — | 外部からの WG エンドポイント (host または IP) |
 | `Port` | 51820 | WG UDP リスニングポート |
-| `InnerAddress` | — | VXLAN オーバーレイ上の自ノード IP |
+| `InnerAddress` | — | VXLAN オーバーレイ上の自ノード IP (CIDR 推奨、例 `10.42.0.1/16`) |
+| `UnderlayAddress` | — | WG インターフェースに割り振る IP (CIDR、switch/hub モードで必須) |
 | `Subnet` | (複数可) | このノードがオーナーシップを持つサブネット |
 | `ConnectTo` | (複数可) | 起動時に接続を試みるピア名 |
 | `Mode` | switch | `switch` / `hub` / `router` |
 | `VXLANID` | 42 | VXLAN VNI |
 | `VXLANPort` | 4789 | VXLAN UDP ポート |
-| `MTU` | 1450 | WG インターフェース MTU |
+| `MTU` | 1420 | WG インターフェース MTU (VXLAN は内部で `-50`) |
 | `STUN` | — | STUN サーバ (host:port、複数可) |
 | `UPnP` | no | `yes` / `udponly` / `no` |
 | `UPnPRefreshPeriod` | 60 | UPnP ポートマッピング再設置間隔 (秒) |
@@ -120,12 +128,15 @@ ConfDir に置いた以下の実行可能ファイルが、対応するイベン
 
 環境変数: `NETNAME`, `NAME`, `DEVICE`, `INTERFACE`, `NODE`, `REMOTEADDRESS`, `REMOTEPORT`, `SUBNET`, `WEIGHT`, `INVITATION_FILE`, `INVITATION_URL`。
 
-例 (`/etc/gsnet/vpn/gsnet-up`):
+アドレス割り当てと link up はデータプレーン reconciler が自動で行うので、フックでやる必要はありません。フックは「上がった後」にやりたいこと (firewall ルール、ブリッジ作成、隣接ノードへの通知など) に使います。
+
+例 (`/etc/gsnet/vpn/gsnet-up` — VXLAN をローカルブリッジに接続する):
 
 ```sh
 #!/bin/sh
-ip addr add 10.42.0.1/16 dev $INTERFACE
-ip link set $INTERFACE up
+ip link add br-vpn type bridge
+ip link set $INTERFACE master br-vpn
+ip link set br-vpn up
 ```
 
 ## CLI コマンド

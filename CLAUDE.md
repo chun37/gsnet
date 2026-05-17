@@ -12,7 +12,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **WireGuard** がトンネル鍵交換と認証付き暗号化を担う。独自プロトコルは無い。
 - **VXLAN** が L2 フレームをカプセル化する。ブロードキャスト/マルチキャスト/ARP 含む完全な L2 接続。
 - Linux カーネルの WireGuard + VXLAN ドライバを使用 (ユーザースペース実装は無し)。
-- VXLAN は **unicast head-end replication** (FDB + 動的 MAC 学習) で動作。マルチキャスト IP は前提としない。
+- VXLAN は **unicast head-end replication** + **決定論的 MAC** で動作。reconciler が broadcast MAC とピア MAC の両方の FDB エントリを pre-install するので、kernel 動的 MAC 学習に依存せず初手から確実にユニキャストできる。マルチキャスト IP は前提としない。
+- **オーバーレイ ( `InnerAddress`) と WG アンダーレイ (`UnderlayAddress`) は別アドレス空間**。WG インターフェースが UnderlayAddress を持ち、VXLAN encap はそれをソースに使う。VXLAN デバイスは InnerAddress を持つ。同一空間にすると kernel の `vxlan_get_route` が ELOOP で全フレームを drop する。
 
 ### コントロールプレーン: Ed25519 署名ゴシップ
 - TCP 接続でピア間に JSON envelope をフラッディング。
@@ -115,8 +116,11 @@ sudo gsnetd -n vpn
 ## 重要な実装メモ
 
 - **gossip envelope は安定 ID**: 同じ事実は同じ ID。`<origin>/<kind>/<key>`。dedup は TS 比較で、新しい TS が古いものを上書き。heartbeat は outbox を再放送するだけなのでメモリは事実数で有界。
+- **gossip.Hello が overlay/underlay を運ぶ**: `InnerAddr` / `UnderlayAddr` フィールドを持ち、各ノードが自分のアドレスを Hello で fan-out する。受信側は Plane の `InnerAddrOf` / `UnderlayAddrOf` で参照、`buildState` は gossip-learned > `hosts/<peer>` のフォールバック順。`KindDelNode` でこれらと `endpoints` / `pubKeys` も purge。
 - **invitation は ECDH 暗号化**: `INVITE2 GET/JOIN` プロトコル。X25519 鍵共有、ChaCha20-Poly1305 で本体暗号化、Ed25519 で inviter 認証。URL の keyhash が MITM 検出キー。
-- **VXLAN は Learning=true (switch モード)**: 動的 MAC 学習は kernel が担当。reconciler は broadcast MAC エントリ (head-end replication) のみ管理し、kernel-learned エントリには触れない。hub モードでは Learning=false。
+- **VXLAN MAC は決定論的**: `vxlanMACFromKey(WGPublicKey)` = SHA-256(pubkey)[:6] に local-admin ビット ON / multicast ビット OFF。両ピアが相手の MAC を独立に計算できるので、unicast FDB エントリを pre-install できる ( `reconcileFDB` がブロードキャスト MAC とピア MAC の 2 種を管理)。switch モードは `Learning=true` のまま、hub は `Learning=false`。
+- **WG ピア管理は idempotent**: `ConfigureDevice` に `ReplacePeers=true` を渡すと kernel が毎 reconcile でセッション (handshake / replay counter) を壊すため、`configureWGPeers` は existing-peers を列挙して消えたものだけ `Remove=true` を立てる差分適用。
+- **VXLAN SrcAddr は creation-only**: kernel の VXLAN driver は SrcAddr 変更 API を持たないので、`ensureVXLAN` は既存 link の `vx.SrcAddr` を `LocalUnderlayAddr` と比較して drift があれば `LinkDel` → 再作成する。
 - **NAT 越え**: 各ノードが STUN/UPnP で reflexive アドレスを発見 → gossip Hello で公開 → 全ピアの WG ピア設定が更新 → PersistentKeepalive (25 秒) が両側の NAT pinhole を開く。symmetric NAT 用のリレーは未実装。
 - **Plane の競合修正**: `Receive` は verify → claim (CAS) → apply → Broadcast の順。`claim` は TS 比較を 1 つの critical section で行うため、並行受信での二重 apply が起きない。
 - **Transport.Dial は冪等**: 既存接続が同じ outbound アドレスを持つなら no-op。`maintainPeer` の周期再 Dial で接続数が無限増加することを防ぐ。
