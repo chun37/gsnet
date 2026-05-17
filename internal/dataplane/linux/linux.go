@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -110,8 +111,11 @@ func (r *Reconciler) Reconcile(s dataplane.State) error {
 		if s.VXLANInterface == "" {
 			return errors.New("dataplane: VXLANInterface is required for switch/hub mode")
 		}
-		if s.LocalInnerAddr == (netip.Addr{}) {
+		if !s.LocalInnerAddr.IsValid() {
 			return errors.New("dataplane: LocalInnerAddr is required for switch/hub mode")
+		}
+		if !s.LocalUnderlayAddr.IsValid() {
+			return errors.New("dataplane: LocalUnderlayAddr is required for switch/hub mode")
 		}
 		if err := r.ensureVXLAN(s); err != nil {
 			return fmt.Errorf("ensureVXLAN: %w", err)
@@ -146,6 +150,17 @@ func (r *Reconciler) ensureWGInterface(s dataplane.State) error {
 		link, err = netlink.LinkByName(s.WGInterface)
 		if err != nil {
 			return err
+		}
+	}
+	if s.MTU > 0 && link.Attrs().MTU != s.MTU {
+		if err := netlink.LinkSetMTU(link, s.MTU); err != nil {
+			return fmt.Errorf("LinkSetMTU %s: %w", s.WGInterface, err)
+		}
+	}
+	if s.LocalUnderlayAddr.IsValid() {
+		addr := &netlink.Addr{IPNet: prefixToIPNetP(s.LocalUnderlayAddr)}
+		if err := netlink.AddrReplace(link, addr); err != nil {
+			return fmt.Errorf("AddrReplace wg %s: %w", s.WGInterface, err)
 		}
 	}
 	if err := netlink.LinkSetUp(link); err != nil {
@@ -213,6 +228,7 @@ func (r *Reconciler) ensureVXLAN(s dataplane.State) error {
 			Port:         int(s.VXLANPort),
 			Learning:     s.Mode != dataplane.ModeHub,
 			VtepDevIndex: wgLink.Attrs().Index,
+			SrcAddr:      net.IP(s.LocalUnderlayAddr.Addr().AsSlice()),
 		}
 		if err := netlink.LinkAdd(vx); err != nil {
 			return fmt.Errorf("LinkAdd vxlan: %w", err)
@@ -223,7 +239,15 @@ func (r *Reconciler) ensureVXLAN(s dataplane.State) error {
 		}
 	}
 
-	addr := &netlink.Addr{IPNet: addrToHostNet(s.LocalInnerAddr)}
+	if s.MTU > 0 {
+		want := s.MTU - 50
+		if link.Attrs().MTU != want {
+			if err := netlink.LinkSetMTU(link, want); err != nil {
+				return fmt.Errorf("LinkSetMTU vxlan %s: %w", s.VXLANInterface, err)
+			}
+		}
+	}
+	addr := &netlink.Addr{IPNet: prefixToIPNetP(s.LocalInnerAddr)}
 	if err := netlink.AddrReplace(link, addr); err != nil {
 		return fmt.Errorf("AddrReplace: %w", err)
 	}
@@ -241,13 +265,16 @@ func (r *Reconciler) reconcileFDB(s dataplane.State) error {
 
 	desired := make(map[string]struct{})
 	for _, p := range s.Peers {
-		if p.InnerAddr == (netip.Addr{}) {
+		// FDB destination must be the peer's WG-underlay IP (the VXLAN
+		// outer destination) — not the overlay InnerAddr, which would
+		// route back into the VXLAN device itself (ELOOP).
+		if !p.UnderlayAddr.IsValid() {
 			continue
 		}
-		desired[p.InnerAddr.String()] = struct{}{}
+		desired[p.UnderlayAddr.String()] = struct{}{}
 	}
 
-	existing, err := netlink.NeighList(link.Attrs().Index, 0)
+	existing, err := netlink.NeighList(link.Attrs().Index, syscall.AF_BRIDGE)
 	if err != nil {
 		return fmt.Errorf("NeighList: %w", err)
 	}
@@ -267,7 +294,7 @@ func (r *Reconciler) reconcileFDB(s dataplane.State) error {
 		parsed, _ := netip.ParseAddr(ip)
 		entry := &netlink.Neigh{
 			LinkIndex:    link.Attrs().Index,
-			Family:       netlink.FAMILY_ALL,
+			Family:       syscall.AF_BRIDGE,
 			State:        netlink.NUD_PERMANENT,
 			Flags:        netlink.NTF_SELF,
 			IP:           net.IP(parsed.AsSlice()),
@@ -284,7 +311,7 @@ func (r *Reconciler) reconcileFDB(s dataplane.State) error {
 		parsed, _ := netip.ParseAddr(ip)
 		entry := &netlink.Neigh{
 			LinkIndex:    link.Attrs().Index,
-			Family:       netlink.FAMILY_ALL,
+			Family:       syscall.AF_BRIDGE,
 			IP:           net.IP(parsed.AsSlice()),
 			HardwareAddr: broadcastMAC(),
 		}
@@ -310,6 +337,13 @@ func addrToHostNet(a netip.Addr) *net.IPNet {
 	return &net.IPNet{
 		IP:   net.IP(a.AsSlice()),
 		Mask: net.CIDRMask(a.BitLen(), a.BitLen()),
+	}
+}
+
+func prefixToIPNetP(p netip.Prefix) *net.IPNet {
+	return &net.IPNet{
+		IP:   net.IP(p.Addr().AsSlice()),
+		Mask: net.CIDRMask(p.Bits(), p.Addr().BitLen()),
 	}
 }
 

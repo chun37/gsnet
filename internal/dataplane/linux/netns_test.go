@@ -60,25 +60,29 @@ func TestReconcile_InNetNS(t *testing.T) {
 
 		priv, _ := wgtypes.GeneratePrivateKey()
 		peerPriv, _ := wgtypes.GeneratePrivateKey()
-		inner := netip.MustParseAddr("10.42.0.1")
+		inner := netip.MustParsePrefix("10.42.0.1/24")
 		peerInner := netip.MustParseAddr("10.42.0.2")
+		underlay := netip.MustParsePrefix("172.16.0.1/24")
+		peerUnderlay := netip.MustParseAddr("172.16.0.2")
 
 		state := dataplane.State{
-			WGPrivate:      priv,
-			WGInterface:    "wg-test",
-			WGListenPort:   51820,
-			VXLANInterface: "vx-test",
-			VXLANID:        42,
-			VXLANPort:      4789,
-			LocalInnerAddr: inner,
-			MTU:            1450,
+			WGPrivate:         priv,
+			WGInterface:       "wg-test",
+			WGListenPort:      51820,
+			VXLANInterface:    "vx-test",
+			VXLANID:           42,
+			VXLANPort:         4789,
+			LocalInnerAddr:    inner,
+			LocalUnderlayAddr: underlay,
+			MTU:               1450,
 			Peers: []dataplane.Peer{
 				{
-					Name:      "bob",
-					WGPublic:  peerPriv.PublicKey(),
-					InnerAddr: peerInner,
+					Name:         "bob",
+					WGPublic:     peerPriv.PublicKey(),
+					InnerAddr:    peerInner,
+					UnderlayAddr: peerUnderlay,
 					AllowedIPs: []netip.Prefix{
-						netip.PrefixFrom(peerInner, peerInner.BitLen()),
+						netip.PrefixFrom(peerUnderlay, peerUnderlay.BitLen()),
 					},
 				},
 			},
@@ -100,7 +104,8 @@ func TestReconcile_InNetNS(t *testing.T) {
 			t.Errorf("LinkByName(vx-test): %v", err)
 		}
 
-		// Verify FDB has a ff:ff:ff:ff:ff:ff entry pointing at peerInner.
+		// Verify FDB has a ff:ff:ff:ff:ff:ff entry pointing at the peer's
+		// underlay address (the VXLAN encap destination, not the overlay).
 		vxLink, _ := netlink.LinkByName("vx-test")
 		neighs, err := netlink.NeighList(vxLink.Attrs().Index, 0)
 		if err != nil {
@@ -108,13 +113,13 @@ func TestReconcile_InNetNS(t *testing.T) {
 		}
 		found := false
 		for _, n := range neighs {
-			if n.HardwareAddr.String() == "ff:ff:ff:ff:ff:ff" && n.IP.String() == peerInner.String() {
+			if n.HardwareAddr.String() == "ff:ff:ff:ff:ff:ff" && n.IP.String() == peerUnderlay.String() {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Errorf("FDB missing broadcast entry for %s", peerInner)
+			t.Errorf("FDB missing broadcast entry for %s", peerUnderlay)
 		}
 
 		// Idempotency: Reconcile again should not error.
