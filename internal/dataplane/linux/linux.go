@@ -234,12 +234,30 @@ func (r *Reconciler) ensureVXLAN(s dataplane.State) error {
 		return fmt.Errorf("LinkByName %s: %w", s.WGInterface, err)
 	}
 
+	wantSrc := net.IP(s.LocalUnderlayAddr.Addr().AsSlice())
+
 	link, err := netlink.LinkByName(s.VXLANInterface)
 	if err != nil {
 		var notFound netlink.LinkNotFoundError
 		if !errors.As(err, &notFound) {
 			return err
 		}
+		link = nil
+	} else if vx, ok := link.(*netlink.Vxlan); ok {
+		// SrcAddr is a creation-time-only attribute of the kernel VXLAN
+		// driver; the only way to change it is to delete + recreate the
+		// device. Do this when LocalUnderlayAddr changed (e.g. operator
+		// reconfigured & SIGHUP'd), otherwise encapsulated UDP would keep
+		// going out the old source and route back into the ELOOP path.
+		if !vx.SrcAddr.Equal(wantSrc) {
+			if err := netlink.LinkDel(link); err != nil {
+				return fmt.Errorf("LinkDel vxlan %s (SrcAddr drift): %w", s.VXLANInterface, err)
+			}
+			link = nil
+		}
+	}
+
+	if link == nil {
 		la := netlink.NewLinkAttrs()
 		la.Name = s.VXLANInterface
 		la.ParentIndex = wgLink.Attrs().Index
@@ -263,7 +281,7 @@ func (r *Reconciler) ensureVXLAN(s dataplane.State) error {
 			Port:         int(s.VXLANPort),
 			Learning:     s.Mode != dataplane.ModeHub,
 			VtepDevIndex: wgLink.Attrs().Index,
-			SrcAddr:      net.IP(s.LocalUnderlayAddr.Addr().AsSlice()),
+			SrcAddr:      wantSrc,
 		}
 		if err := netlink.LinkAdd(vx); err != nil {
 			return fmt.Errorf("LinkAdd vxlan: %w", err)

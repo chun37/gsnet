@@ -10,6 +10,7 @@
 package linux
 
 import (
+	"net"
 	"net/netip"
 	"os"
 	"runtime"
@@ -125,6 +126,25 @@ func TestReconcile_InNetNS(t *testing.T) {
 		// Idempotency: Reconcile again should not error.
 		if err := r.Reconcile(state); err != nil {
 			t.Errorf("Reconcile (second call): %v", err)
+		}
+
+		// SrcAddr drift: changing LocalUnderlayAddr must trigger a VXLAN
+		// recreate because the kernel doesn't support modifying the local
+		// source after creation. Verify the device's SrcAddr actually moved.
+		state.LocalUnderlayAddr = netip.MustParsePrefix("172.16.0.99/24")
+		if err := r.Reconcile(state); err != nil {
+			t.Fatalf("Reconcile after UnderlayAddr change: %v", err)
+		}
+		vxLink2, err := netlink.LinkByName("vx-test")
+		if err != nil {
+			t.Fatalf("LinkByName(vx-test) after recreate: %v", err)
+		}
+		vx, ok := vxLink2.(*netlink.Vxlan)
+		if !ok {
+			t.Fatalf("vx-test is not *netlink.Vxlan (got %T)", vxLink2)
+		}
+		if !vx.SrcAddr.Equal(net.ParseIP("172.16.0.99").To4()) {
+			t.Errorf("VXLAN SrcAddr = %v, want 172.16.0.99", vx.SrcAddr)
 		}
 	})
 }

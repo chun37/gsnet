@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"net/netip"
-	"strings"
 	"testing"
 
 	"github.com/chun/gsnet/internal/config"
@@ -66,6 +65,117 @@ func TestBuildState_GossipEndpointOverridesHostFile(t *testing.T) {
 	}
 }
 
+// TestBuildState_GossipPopulatesInnerAndUnderlay covers the workflow where a
+// peer's overlay (Inner) and underlay (Underlay) addresses are not present
+// in hosts/<peer> — that file is only seeded with public keys at invite/join
+// time — but arrive later via the peer's gossip Hello. buildState must use
+// the gossip-learned values; otherwise switch/hub mode silently produces
+// empty AllowedIPs and no FDB entries.
+func TestBuildState_GossipPopulatesInnerAndUnderlay(t *testing.T) {
+	root := t.TempDir()
+	p := Paths{ConfRoot: root, Netname: "vpn"}
+	if err := Init(p, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	// hosts/bob with public keys only — typical post-join state.
+	bobPriv, _ := keys.GenerateEd25519()
+	bobWG, _ := keys.GenerateWireGuard()
+	hostBody := config.Entries{
+		{Key: "Ed25519PublicKey", Value: bobPriv.Public().String()},
+		{Key: "WGPublicKey", Value: bobWG.Public().String()},
+	}.Render()
+	if err := writeHostFile(p, "bob", hostBody); err != nil {
+		t.Fatal(err)
+	}
+
+	d, cancel, done := startMinimal(t, p)
+	defer func() { cancel(); <-done }()
+
+	hello := gossip.Hello{
+		Name:          "bob",
+		Ed25519Public: bobPriv.Public().Raw(),
+		WGPublic:      bobWG.Public().String(),
+		InnerAddr:     "10.42.0.2/24",
+		UnderlayAddr:  "172.16.0.2/24",
+	}
+	if err := injectHelloAs(d, "bob", bobPriv, hello); err != nil {
+		t.Fatal(err)
+	}
+
+	state := d.buildState()
+	var bobPeer bool
+	for _, pe := range state.Peers {
+		if pe.Name != "bob" {
+			continue
+		}
+		bobPeer = true
+		if got, want := pe.InnerAddr, netip.MustParseAddr("10.42.0.2"); got != want {
+			t.Errorf("peer InnerAddr = %v, want %v (gossip-learned)", got, want)
+		}
+		if got, want := pe.UnderlayAddr, netip.MustParseAddr("172.16.0.2"); got != want {
+			t.Errorf("peer UnderlayAddr = %v, want %v (gossip-learned)", got, want)
+		}
+		// AllowedIPs in switch mode tracks the underlay /32.
+		if len(pe.AllowedIPs) != 1 ||
+			pe.AllowedIPs[0] != netip.PrefixFrom(netip.MustParseAddr("172.16.0.2"), 32) {
+			t.Errorf("peer AllowedIPs = %v, want [172.16.0.2/32]", pe.AllowedIPs)
+		}
+	}
+	if !bobPeer {
+		t.Errorf("buildState did not include bob")
+	}
+}
+
+// TestBuildState_HostFileFallbackForInnerAndUnderlay confirms that if no
+// gossip Hello has arrived yet, hosts/<peer> entries are still honored.
+// (Allows export/import-driven setups and lets reconciliation start before
+// the first Hello is delivered.)
+func TestBuildState_HostFileFallbackForInnerAndUnderlay(t *testing.T) {
+	root := t.TempDir()
+	p := Paths{ConfRoot: root, Netname: "vpn"}
+	if err := Init(p, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	bobPriv, _ := keys.GenerateEd25519()
+	bobWG, _ := keys.GenerateWireGuard()
+	hostBody := config.Entries{
+		{Key: "Ed25519PublicKey", Value: bobPriv.Public().String()},
+		{Key: "WGPublicKey", Value: bobWG.Public().String()},
+		{Key: "InnerAddress", Value: "10.42.0.2"},
+		{Key: "UnderlayAddress", Value: "172.16.0.2"},
+	}.Render()
+	if err := writeHostFile(p, "bob", hostBody); err != nil {
+		t.Fatal(err)
+	}
+
+	d, cancel, done := startMinimal(t, p)
+	defer func() { cancel(); <-done }()
+	// Bob is in the graph only after some envelope arrives; inject a minimal
+	// Hello (no Inner/Underlay) so buildState iterates over him.
+	if err := injectHelloAs(d, "bob", bobPriv, gossip.Hello{
+		Name:          "bob",
+		Ed25519Public: bobPriv.Public().Raw(),
+		WGPublic:      bobWG.Public().String(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	state := d.buildState()
+	var bobPeer bool
+	for _, pe := range state.Peers {
+		if pe.Name != "bob" {
+			continue
+		}
+		bobPeer = true
+		if got, want := pe.UnderlayAddr, netip.MustParseAddr("172.16.0.2"); got != want {
+			t.Errorf("peer UnderlayAddr = %v, want %v (hosts fallback)", got, want)
+		}
+	}
+	if !bobPeer {
+		t.Errorf("buildState did not include bob")
+	}
+}
+
 func writeHostFile(p Paths, name, body string) error {
 	if err := mkdirAll(p.HostsDir(), 0o700); err != nil {
 		return err
@@ -85,10 +195,5 @@ func injectHelloAs(d *Daemon, as string, asPriv keys.Ed25519Private, h gossip.He
 		Payload: body,
 	}
 	env.Signature = asPriv.Sign(env.SigningBytes())
-	// The daemon installs a verifier that consults hosts/<peer>; ensure the
-	// host file ed25519 matches the signing key.
-	if !strings.Contains(as, "/") {
-		// hosts/<as> is already in place from the test setup.
-	}
 	return d.plane.Receive(env)
 }

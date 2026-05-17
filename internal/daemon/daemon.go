@@ -292,6 +292,22 @@ func (d *Daemon) load() error {
 	return nil
 }
 
+// addrFromHostEntry reads a host-file entry that may be a bare address or a
+// CIDR prefix and returns just the address (the prefix length is only
+// meaningful on the originator). Zero value if the key is missing or
+// unparseable.
+func addrFromHostEntry(e config.Entries, key string) netip.Addr {
+	v, ok := e.GetFirst(key)
+	if !ok {
+		return netip.Addr{}
+	}
+	p, err := parseAddrOrPrefix(v)
+	if err != nil {
+		return netip.Addr{}
+	}
+	return p.Addr()
+}
+
 // parseAddrOrPrefix parses "1.2.3.4" as a /32 prefix and "1.2.3.4/24" as
 // the full prefix. Hosts use bare addresses, local configs use a prefix so
 // the kernel installs the subnet route on the right interface.
@@ -330,6 +346,12 @@ func (d *Daemon) announceLocal() error {
 	}
 	if ep := d.endpoint.Get(); ep.IsValid() {
 		hello.Endpoint = ep.String()
+	}
+	if l.InnerAddr.IsValid() {
+		hello.InnerAddr = l.InnerAddr.String()
+	}
+	if l.UnderlayAddr.IsValid() {
+		hello.UnderlayAddr = l.UnderlayAddr.String()
 	}
 	if err := d.plane.AnnounceHello(hello); err != nil {
 		return err
@@ -400,17 +422,17 @@ func (d *Daemon) buildState() dataplane.State {
 				}
 			}
 		}
-		var inner netip.Addr
-		if v, ok := hostEntries.GetFirst("InnerAddress"); ok {
-			if p, err := parseAddrOrPrefix(v); err == nil {
-				inner = p.Addr()
-			}
+		// Address precedence (mirrors Endpoint): gossip-learned > hosts/<peer>.
+		// Gossip is the source of truth once a Hello has arrived; hosts/ is the
+		// pre-gossip fallback (e.g. peer not yet reachable, or addresses set
+		// out-of-band via export/import).
+		inner := d.plane.InnerAddrOf(peer)
+		if !inner.IsValid() {
+			inner = addrFromHostEntry(hostEntries, "InnerAddress")
 		}
-		var underlay netip.Addr
-		if v, ok := hostEntries.GetFirst("UnderlayAddress"); ok {
-			if p, err := parseAddrOrPrefix(v); err == nil {
-				underlay = p.Addr()
-			}
+		underlay := d.plane.UnderlayAddrOf(peer)
+		if !underlay.IsValid() {
+			underlay = addrFromHostEntry(hostEntries, "UnderlayAddress")
 		}
 		allowed := d.allowedIPsFor(l.Mode, peer, underlay)
 		state.Peers = append(state.Peers, dataplane.Peer{

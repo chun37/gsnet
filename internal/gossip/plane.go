@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"sync"
 
 	"github.com/chun/gsnet/internal/graph"
@@ -46,7 +47,9 @@ type Plane struct {
 	edPriv    *keys.Ed25519Private
 	pubKeyFor func(origin string) (keys.Ed25519Public, bool)
 	pubKeys   map[string]keys.Ed25519Public
-	endpoints map[string]string // origin → "host:port" learned from Hello
+	endpoints map[string]string     // origin → "host:port" learned from Hello
+	inners    map[string]netip.Addr // origin → overlay addr (parsed at apply)
+	underlays map[string]netip.Addr // origin → WG-underlay addr (parsed at apply)
 }
 
 func NewPlane(nodeName string, g *graph.Graph, t Transport) *Plane {
@@ -58,6 +61,8 @@ func NewPlane(nodeName string, g *graph.Graph, t Transport) *Plane {
 		outbox:    make(map[string]Envelope),
 		pubKeys:   make(map[string]keys.Ed25519Public),
 		endpoints: make(map[string]string),
+		inners:    make(map[string]netip.Addr),
+		underlays: make(map[string]netip.Addr),
 	}
 }
 
@@ -67,6 +72,22 @@ func (p *Plane) EndpointOf(origin string) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.endpoints[origin]
+}
+
+// InnerAddrOf returns the most recent overlay (VXLAN) address advertised by
+// origin via Hello. Zero value if not yet announced.
+func (p *Plane) InnerAddrOf(origin string) netip.Addr {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.inners[origin]
+}
+
+// UnderlayAddrOf returns the most recent WG-underlay address advertised by
+// origin via Hello. Zero value if not yet announced.
+func (p *Plane) UnderlayAddrOf(origin string) netip.Addr {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.underlays[origin]
 }
 
 // SetSigner installs the Ed25519 private key used to sign outgoing envelopes.
@@ -230,11 +251,19 @@ func (p *Plane) apply(env Envelope) {
 		if pub, err := keys.ParseEd25519PublicBase64ish(h.Ed25519Public); err == nil {
 			p.rememberPubKey(h.Name, pub)
 		}
+		inner := parseHelloAddr(h.InnerAddr)
+		underlay := parseHelloAddr(h.UnderlayAddr)
+		p.mu.Lock()
 		if h.Endpoint != "" {
-			p.mu.Lock()
 			p.endpoints[h.Name] = h.Endpoint
-			p.mu.Unlock()
 		}
+		if inner.IsValid() {
+			p.inners[h.Name] = inner
+		}
+		if underlay.IsValid() {
+			p.underlays[h.Name] = underlay
+		}
+		p.mu.Unlock()
 	case KindDelNode:
 		var h Hello
 		if err := json.Unmarshal(env.Payload, &h); err != nil || h.Name == "" {
@@ -245,6 +274,12 @@ func (p *Plane) apply(env Envelope) {
 				p.G.DelEdge(e.From, e.To)
 			}
 		}
+		p.mu.Lock()
+		delete(p.endpoints, h.Name)
+		delete(p.inners, h.Name)
+		delete(p.underlays, h.Name)
+		delete(p.pubKeys, h.Name)
+		p.mu.Unlock()
 	case KindAddEdge:
 		var e AddEdge
 		if err := json.Unmarshal(env.Payload, &e); err != nil {
@@ -312,3 +347,18 @@ func (p *Plane) AnnounceDelSubnet(subnet string) error {
 
 // ErrPeerUnknown is returned by transports that don't know the destination.
 var ErrPeerUnknown = fmt.Errorf("gossip: unknown peer")
+
+// parseHelloAddr accepts either a bare address or a CIDR prefix string and
+// returns just the address. The prefix length is irrelevant to peers (only
+// the originator's kernel uses it for the subnet route on its own VXLAN /
+// WG link), so receivers always strip it.
+func parseHelloAddr(s string) netip.Addr {
+	if s == "" {
+		return netip.Addr{}
+	}
+	if p, err := netip.ParsePrefix(s); err == nil {
+		return p.Addr()
+	}
+	a, _ := netip.ParseAddr(s)
+	return a
+}
