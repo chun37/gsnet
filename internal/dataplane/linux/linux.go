@@ -14,6 +14,7 @@
 package linux
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -251,6 +252,11 @@ func (r *Reconciler) ensureVXLAN(s dataplane.State) error {
 		// modes for head-end replication; the reconciler ignores
 		// non-broadcast FDB rows so kernel-learned entries are not
 		// disturbed.
+		// Pin the device MAC to a deterministic value derived from our WG
+		// public key. Every peer can compute it the same way, so they can
+		// install matching unicast FDB entries without an extra gossip
+		// round-trip (see reconcileFDB).
+		la.HardwareAddr = vxlanMACFromKey(s.WGPrivate.PublicKey())
 		vx := &netlink.Vxlan{
 			LinkAttrs:    la,
 			VxlanId:      int(s.VXLANID),
@@ -265,6 +271,14 @@ func (r *Reconciler) ensureVXLAN(s dataplane.State) error {
 		link, err = netlink.LinkByName(s.VXLANInterface)
 		if err != nil {
 			return err
+		}
+	}
+	// Re-pin the MAC on existing links in case it drifted (e.g. created
+	// before this code, or kernel re-randomised after a link recreate).
+	wantMAC := vxlanMACFromKey(s.WGPrivate.PublicKey())
+	if link.Attrs().HardwareAddr.String() != wantMAC.String() {
+		if err := netlink.LinkSetHardwareAddr(link, wantMAC); err != nil {
+			return fmt.Errorf("LinkSetHardwareAddr %s: %w", s.VXLANInterface, err)
 		}
 	}
 
@@ -283,16 +297,32 @@ func (r *Reconciler) ensureVXLAN(s dataplane.State) error {
 	return netlink.LinkSetUp(link)
 }
 
-// reconcileFDB ensures the VXLAN FDB has exactly one "broadcast" entry per
-// known remote peer (head-end replication). Any entry not in the desired set
-// is removed.
+// fdbKey is a (MAC, underlay-IP) pair identifying a single FDB row.
+type fdbKey struct {
+	mac string
+	ip  string
+}
+
+// reconcileFDB ensures the VXLAN FDB has, per peer, both:
+//   - a head-end-replication entry (broadcast MAC → peer underlay IP), so
+//     ARP requests / unknown unicast can flood to every known peer;
+//   - a unicast entry (peer's deterministic VXLAN MAC → peer underlay IP),
+//     so post-ARP unicast frames go directly to the right peer without
+//     relying on kernel MAC learning (which we've observed to be flaky
+//     for VXLAN-over-WireGuard).
+//
+// Both MAC families are managed by this reconciler. Other (kernel-learned
+// or operator-installed) FDB rows are left alone.
 func (r *Reconciler) reconcileFDB(s dataplane.State) error {
 	link, err := netlink.LinkByName(s.VXLANInterface)
 	if err != nil {
 		return err
 	}
 
-	desired := make(map[string]struct{})
+	bcast := broadcastMAC().String()
+	managedMACs := map[string]struct{}{bcast: {}}
+
+	desired := make(map[fdbKey]struct{})
 	for _, p := range s.Peers {
 		// FDB destination must be the peer's WG-underlay IP (the VXLAN
 		// outer destination) — not the overlay InnerAddr, which would
@@ -300,55 +330,74 @@ func (r *Reconciler) reconcileFDB(s dataplane.State) error {
 		if !p.UnderlayAddr.IsValid() {
 			continue
 		}
-		desired[p.UnderlayAddr.String()] = struct{}{}
+		ip := p.UnderlayAddr.String()
+		desired[fdbKey{mac: bcast, ip: ip}] = struct{}{}
+		peerMAC := vxlanMACFromKey(p.WGPublic)
+		desired[fdbKey{mac: peerMAC.String(), ip: ip}] = struct{}{}
+		managedMACs[peerMAC.String()] = struct{}{}
 	}
 
 	existing, err := netlink.NeighList(link.Attrs().Index, syscall.AF_BRIDGE)
 	if err != nil {
 		return fmt.Errorf("NeighList: %w", err)
 	}
-	have := make(map[string]struct{})
+	have := make(map[fdbKey]struct{})
 	for _, n := range existing {
-		// FDB entries appear in AF_BRIDGE; filter by MAC ff:ff:ff:ff:ff:ff
-		if n.HardwareAddr.String() != broadcastMAC().String() {
+		mac := n.HardwareAddr.String()
+		if _, ok := managedMACs[mac]; !ok {
 			continue
 		}
-		have[n.IP.String()] = struct{}{}
+		have[fdbKey{mac: mac, ip: n.IP.String()}] = struct{}{}
 	}
 
-	for ip := range desired {
-		if _, ok := have[ip]; ok {
+	for k := range desired {
+		if _, ok := have[k]; ok {
 			continue
 		}
-		parsed, _ := netip.ParseAddr(ip)
+		parsed, _ := netip.ParseAddr(k.ip)
+		mac, _ := net.ParseMAC(k.mac)
 		entry := &netlink.Neigh{
 			LinkIndex:    link.Attrs().Index,
 			Family:       syscall.AF_BRIDGE,
 			State:        netlink.NUD_PERMANENT,
 			Flags:        netlink.NTF_SELF,
 			IP:           net.IP(parsed.AsSlice()),
-			HardwareAddr: broadcastMAC(),
+			HardwareAddr: mac,
 		}
 		if err := netlink.NeighAppend(entry); err != nil {
-			return fmt.Errorf("NeighAppend %s: %w", ip, err)
+			return fmt.Errorf("NeighAppend %s -> %s: %w", k.mac, k.ip, err)
 		}
 	}
-	for ip := range have {
-		if _, ok := desired[ip]; ok {
+	for k := range have {
+		if _, ok := desired[k]; ok {
 			continue
 		}
-		parsed, _ := netip.ParseAddr(ip)
+		parsed, _ := netip.ParseAddr(k.ip)
+		mac, _ := net.ParseMAC(k.mac)
 		entry := &netlink.Neigh{
 			LinkIndex:    link.Attrs().Index,
 			Family:       syscall.AF_BRIDGE,
 			IP:           net.IP(parsed.AsSlice()),
-			HardwareAddr: broadcastMAC(),
+			HardwareAddr: mac,
 		}
 		if err := netlink.NeighDel(entry); err != nil {
-			return fmt.Errorf("NeighDel %s: %w", ip, err)
+			return fmt.Errorf("NeighDel %s -> %s: %w", k.mac, k.ip, err)
 		}
 	}
 	return nil
+}
+
+// vxlanMACFromKey derives a deterministic MAC address from a WireGuard
+// public key. The locally-administered bit is set and the multicast bit is
+// cleared per IEEE 802 conventions. Two peers that know each other's
+// public key (already required for WG) can therefore agree on each other's
+// VXLAN MAC without needing an additional gossip envelope.
+func vxlanMACFromKey(pub wgtypes.Key) net.HardwareAddr {
+	h := sha256.Sum256(pub[:])
+	mac := make(net.HardwareAddr, 6)
+	copy(mac, h[:6])
+	mac[0] = (mac[0] | 0x02) & 0xfe // set local-admin, clear multicast
+	return mac
 }
 
 func broadcastMAC() net.HardwareAddr {
