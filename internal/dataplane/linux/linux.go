@@ -14,11 +14,13 @@
 package linux
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -110,8 +112,11 @@ func (r *Reconciler) Reconcile(s dataplane.State) error {
 		if s.VXLANInterface == "" {
 			return errors.New("dataplane: VXLANInterface is required for switch/hub mode")
 		}
-		if s.LocalInnerAddr == (netip.Addr{}) {
+		if !s.LocalInnerAddr.IsValid() {
 			return errors.New("dataplane: LocalInnerAddr is required for switch/hub mode")
+		}
+		if !s.LocalUnderlayAddr.IsValid() {
+			return errors.New("dataplane: LocalUnderlayAddr is required for switch/hub mode")
 		}
 		if err := r.ensureVXLAN(s); err != nil {
 			return fmt.Errorf("ensureVXLAN: %w", err)
@@ -148,6 +153,17 @@ func (r *Reconciler) ensureWGInterface(s dataplane.State) error {
 			return err
 		}
 	}
+	if s.MTU > 0 && link.Attrs().MTU != s.MTU {
+		if err := netlink.LinkSetMTU(link, s.MTU); err != nil {
+			return fmt.Errorf("LinkSetMTU %s: %w", s.WGInterface, err)
+		}
+	}
+	if s.LocalUnderlayAddr.IsValid() {
+		addr := &netlink.Addr{IPNet: prefixToIPNetP(s.LocalUnderlayAddr)}
+		if err := netlink.AddrReplace(link, addr); err != nil {
+			return fmt.Errorf("AddrReplace wg %s: %w", s.WGInterface, err)
+		}
+	}
 	if err := netlink.LinkSetUp(link); err != nil {
 		return fmt.Errorf("LinkSetUp %s: %w", s.WGInterface, err)
 	}
@@ -155,6 +171,21 @@ func (r *Reconciler) ensureWGInterface(s dataplane.State) error {
 }
 
 func (r *Reconciler) configureWGPeers(s dataplane.State) error {
+	// We want a single ConfigureDevice call that:
+	//   - adds new peers,
+	//   - updates existing peers' AllowedIPs / endpoint,
+	//   - removes peers that disappeared from desired state.
+	// We must NOT use ReplacePeers=true unconditionally: that removes every
+	// peer first and re-adds them, which destroys the kernel WG session state
+	// (handshake, replay counter) every time we reconcile. With gsnet's
+	// reconcile-on-every-gossip-envelope cadence that means a fresh handshake
+	// on every heartbeat — and during the handshake window data packets get
+	// dropped, looking like flaky/intermittent connectivity.
+	desired := make(map[wgtypes.Key]dataplane.Peer, len(s.Peers))
+	for _, p := range s.Peers {
+		desired[p.WGPublic] = p
+	}
+
 	peers := make([]wgtypes.PeerConfig, 0, len(s.Peers))
 	for _, p := range s.Peers {
 		pc := wgtypes.PeerConfig{
@@ -174,11 +205,25 @@ func (r *Reconciler) configureWGPeers(s dataplane.State) error {
 		pc.PersistentKeepaliveInterval = &ka
 		peers = append(peers, pc)
 	}
+
+	// Generate Remove entries for any peer currently on the device that's no
+	// longer in `desired`.
+	if dev, err := r.wg.Device(s.WGInterface); err == nil {
+		for _, existing := range dev.Peers {
+			if _, keep := desired[existing.PublicKey]; keep {
+				continue
+			}
+			peers = append(peers, wgtypes.PeerConfig{
+				PublicKey: existing.PublicKey,
+				Remove:    true,
+			})
+		}
+	}
+
 	cfg := wgtypes.Config{
-		PrivateKey:   &s.WGPrivate,
-		ListenPort:   intp(s.WGListenPort),
-		ReplacePeers: true,
-		Peers:        peers,
+		PrivateKey: &s.WGPrivate,
+		ListenPort: intp(s.WGListenPort),
+		Peers:      peers,
 	}
 	return r.wg.ConfigureDevice(s.WGInterface, cfg)
 }
@@ -189,12 +234,30 @@ func (r *Reconciler) ensureVXLAN(s dataplane.State) error {
 		return fmt.Errorf("LinkByName %s: %w", s.WGInterface, err)
 	}
 
+	wantSrc := net.IP(s.LocalUnderlayAddr.Addr().AsSlice())
+
 	link, err := netlink.LinkByName(s.VXLANInterface)
 	if err != nil {
 		var notFound netlink.LinkNotFoundError
 		if !errors.As(err, &notFound) {
 			return err
 		}
+		link = nil
+	} else if vx, ok := link.(*netlink.Vxlan); ok {
+		// SrcAddr is a creation-time-only attribute of the kernel VXLAN
+		// driver; the only way to change it is to delete + recreate the
+		// device. Do this when LocalUnderlayAddr changed (e.g. operator
+		// reconfigured & SIGHUP'd), otherwise encapsulated UDP would keep
+		// going out the old source and route back into the ELOOP path.
+		if !vx.SrcAddr.Equal(wantSrc) {
+			if err := netlink.LinkDel(link); err != nil {
+				return fmt.Errorf("LinkDel vxlan %s (SrcAddr drift): %w", s.VXLANInterface, err)
+			}
+			link = nil
+		}
+	}
+
+	if link == nil {
 		la := netlink.NewLinkAttrs()
 		la.Name = s.VXLANInterface
 		la.ParentIndex = wgLink.Attrs().Index
@@ -207,12 +270,18 @@ func (r *Reconciler) ensureVXLAN(s dataplane.State) error {
 		// modes for head-end replication; the reconciler ignores
 		// non-broadcast FDB rows so kernel-learned entries are not
 		// disturbed.
+		// Pin the device MAC to a deterministic value derived from our WG
+		// public key. Every peer can compute it the same way, so they can
+		// install matching unicast FDB entries without an extra gossip
+		// round-trip (see reconcileFDB).
+		la.HardwareAddr = vxlanMACFromKey(s.WGPrivate.PublicKey())
 		vx := &netlink.Vxlan{
 			LinkAttrs:    la,
 			VxlanId:      int(s.VXLANID),
 			Port:         int(s.VXLANPort),
 			Learning:     s.Mode != dataplane.ModeHub,
 			VtepDevIndex: wgLink.Attrs().Index,
+			SrcAddr:      wantSrc,
 		}
 		if err := netlink.LinkAdd(vx); err != nil {
 			return fmt.Errorf("LinkAdd vxlan: %w", err)
@@ -222,77 +291,131 @@ func (r *Reconciler) ensureVXLAN(s dataplane.State) error {
 			return err
 		}
 	}
+	// Re-pin the MAC on existing links in case it drifted (e.g. created
+	// before this code, or kernel re-randomised after a link recreate).
+	wantMAC := vxlanMACFromKey(s.WGPrivate.PublicKey())
+	if link.Attrs().HardwareAddr.String() != wantMAC.String() {
+		if err := netlink.LinkSetHardwareAddr(link, wantMAC); err != nil {
+			return fmt.Errorf("LinkSetHardwareAddr %s: %w", s.VXLANInterface, err)
+		}
+	}
 
-	addr := &netlink.Addr{IPNet: addrToHostNet(s.LocalInnerAddr)}
+	if s.MTU > 0 {
+		want := s.MTU - 50
+		if link.Attrs().MTU != want {
+			if err := netlink.LinkSetMTU(link, want); err != nil {
+				return fmt.Errorf("LinkSetMTU vxlan %s: %w", s.VXLANInterface, err)
+			}
+		}
+	}
+	addr := &netlink.Addr{IPNet: prefixToIPNetP(s.LocalInnerAddr)}
 	if err := netlink.AddrReplace(link, addr); err != nil {
 		return fmt.Errorf("AddrReplace: %w", err)
 	}
 	return netlink.LinkSetUp(link)
 }
 
-// reconcileFDB ensures the VXLAN FDB has exactly one "broadcast" entry per
-// known remote peer (head-end replication). Any entry not in the desired set
-// is removed.
+// fdbKey is a (MAC, underlay-IP) pair identifying a single FDB row.
+type fdbKey struct {
+	mac string
+	ip  string
+}
+
+// reconcileFDB ensures the VXLAN FDB has, per peer, both:
+//   - a head-end-replication entry (broadcast MAC → peer underlay IP), so
+//     ARP requests / unknown unicast can flood to every known peer;
+//   - a unicast entry (peer's deterministic VXLAN MAC → peer underlay IP),
+//     so post-ARP unicast frames go directly to the right peer without
+//     relying on kernel MAC learning (which we've observed to be flaky
+//     for VXLAN-over-WireGuard).
+//
+// Both MAC families are managed by this reconciler. Other (kernel-learned
+// or operator-installed) FDB rows are left alone.
 func (r *Reconciler) reconcileFDB(s dataplane.State) error {
 	link, err := netlink.LinkByName(s.VXLANInterface)
 	if err != nil {
 		return err
 	}
 
-	desired := make(map[string]struct{})
+	bcast := broadcastMAC().String()
+	managedMACs := map[string]struct{}{bcast: {}}
+
+	desired := make(map[fdbKey]struct{})
 	for _, p := range s.Peers {
-		if p.InnerAddr == (netip.Addr{}) {
+		// FDB destination must be the peer's WG-underlay IP (the VXLAN
+		// outer destination) — not the overlay InnerAddr, which would
+		// route back into the VXLAN device itself (ELOOP).
+		if !p.UnderlayAddr.IsValid() {
 			continue
 		}
-		desired[p.InnerAddr.String()] = struct{}{}
+		ip := p.UnderlayAddr.String()
+		desired[fdbKey{mac: bcast, ip: ip}] = struct{}{}
+		peerMAC := vxlanMACFromKey(p.WGPublic)
+		desired[fdbKey{mac: peerMAC.String(), ip: ip}] = struct{}{}
+		managedMACs[peerMAC.String()] = struct{}{}
 	}
 
-	existing, err := netlink.NeighList(link.Attrs().Index, 0)
+	existing, err := netlink.NeighList(link.Attrs().Index, syscall.AF_BRIDGE)
 	if err != nil {
 		return fmt.Errorf("NeighList: %w", err)
 	}
-	have := make(map[string]struct{})
+	have := make(map[fdbKey]struct{})
 	for _, n := range existing {
-		// FDB entries appear in AF_BRIDGE; filter by MAC ff:ff:ff:ff:ff:ff
-		if n.HardwareAddr.String() != broadcastMAC().String() {
+		mac := n.HardwareAddr.String()
+		if _, ok := managedMACs[mac]; !ok {
 			continue
 		}
-		have[n.IP.String()] = struct{}{}
+		have[fdbKey{mac: mac, ip: n.IP.String()}] = struct{}{}
 	}
 
-	for ip := range desired {
-		if _, ok := have[ip]; ok {
+	for k := range desired {
+		if _, ok := have[k]; ok {
 			continue
 		}
-		parsed, _ := netip.ParseAddr(ip)
+		parsed, _ := netip.ParseAddr(k.ip)
+		mac, _ := net.ParseMAC(k.mac)
 		entry := &netlink.Neigh{
 			LinkIndex:    link.Attrs().Index,
-			Family:       netlink.FAMILY_ALL,
+			Family:       syscall.AF_BRIDGE,
 			State:        netlink.NUD_PERMANENT,
 			Flags:        netlink.NTF_SELF,
 			IP:           net.IP(parsed.AsSlice()),
-			HardwareAddr: broadcastMAC(),
+			HardwareAddr: mac,
 		}
 		if err := netlink.NeighAppend(entry); err != nil {
-			return fmt.Errorf("NeighAppend %s: %w", ip, err)
+			return fmt.Errorf("NeighAppend %s -> %s: %w", k.mac, k.ip, err)
 		}
 	}
-	for ip := range have {
-		if _, ok := desired[ip]; ok {
+	for k := range have {
+		if _, ok := desired[k]; ok {
 			continue
 		}
-		parsed, _ := netip.ParseAddr(ip)
+		parsed, _ := netip.ParseAddr(k.ip)
+		mac, _ := net.ParseMAC(k.mac)
 		entry := &netlink.Neigh{
 			LinkIndex:    link.Attrs().Index,
-			Family:       netlink.FAMILY_ALL,
+			Family:       syscall.AF_BRIDGE,
 			IP:           net.IP(parsed.AsSlice()),
-			HardwareAddr: broadcastMAC(),
+			HardwareAddr: mac,
 		}
 		if err := netlink.NeighDel(entry); err != nil {
-			return fmt.Errorf("NeighDel %s: %w", ip, err)
+			return fmt.Errorf("NeighDel %s -> %s: %w", k.mac, k.ip, err)
 		}
 	}
 	return nil
+}
+
+// vxlanMACFromKey derives a deterministic MAC address from a WireGuard
+// public key. The locally-administered bit is set and the multicast bit is
+// cleared per IEEE 802 conventions. Two peers that know each other's
+// public key (already required for WG) can therefore agree on each other's
+// VXLAN MAC without needing an additional gossip envelope.
+func vxlanMACFromKey(pub wgtypes.Key) net.HardwareAddr {
+	h := sha256.Sum256(pub[:])
+	mac := make(net.HardwareAddr, 6)
+	copy(mac, h[:6])
+	mac[0] = (mac[0] | 0x02) & 0xfe // set local-admin, clear multicast
+	return mac
 }
 
 func broadcastMAC() net.HardwareAddr {
@@ -310,6 +433,13 @@ func addrToHostNet(a netip.Addr) *net.IPNet {
 	return &net.IPNet{
 		IP:   net.IP(a.AsSlice()),
 		Mask: net.CIDRMask(a.BitLen(), a.BitLen()),
+	}
+}
+
+func prefixToIPNetP(p netip.Prefix) *net.IPNet {
+	return &net.IPNet{
+		IP:   net.IP(p.Addr().AsSlice()),
+		Mask: net.CIDRMask(p.Bits(), p.Addr().BitLen()),
 	}
 }
 

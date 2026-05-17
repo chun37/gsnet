@@ -68,7 +68,8 @@ type loaded struct {
 	VXLANID      uint32
 	VXLANPort    uint16
 	MTU          int
-	InnerAddr    netip.Addr
+	InnerAddr    netip.Prefix // overlay (assigned to the VXLAN device)
+	UnderlayAddr netip.Prefix // WG underlay (assigned to the WG interface)
 
 	Subnets []subnet.Subnet
 }
@@ -254,14 +255,27 @@ func (d *Daemon) load() error {
 			l.VXLANID = uint32(p)
 		}
 	}
-	l.MTU = 1450
+	l.MTU = 1420
+	if v, ok := entries.GetFirst("MTU"); ok {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 {
+			l.MTU = p
+		}
+	}
 
 	if v, ok := entries.GetFirst("InnerAddress"); ok {
-		a, err := netip.ParseAddr(v)
+		p, err := parseAddrOrPrefix(v)
 		if err != nil {
 			return fmt.Errorf("InnerAddress %q: %w", v, err)
 		}
-		l.InnerAddr = a
+		l.InnerAddr = p
+	}
+
+	if v, ok := entries.GetFirst("UnderlayAddress"); ok {
+		p, err := parseAddrOrPrefix(v)
+		if err != nil {
+			return fmt.Errorf("UnderlayAddress %q: %w", v, err)
+		}
+		l.UnderlayAddr = p
 	}
 
 	for _, s := range entries.GetAll("Subnet") {
@@ -276,6 +290,36 @@ func (d *Daemon) load() error {
 	d.loaded = l
 	d.mu.Unlock()
 	return nil
+}
+
+// addrFromHostEntry reads a host-file entry that may be a bare address or a
+// CIDR prefix and returns just the address (the prefix length is only
+// meaningful on the originator). Zero value if the key is missing or
+// unparseable.
+func addrFromHostEntry(e config.Entries, key string) netip.Addr {
+	v, ok := e.GetFirst(key)
+	if !ok {
+		return netip.Addr{}
+	}
+	p, err := parseAddrOrPrefix(v)
+	if err != nil {
+		return netip.Addr{}
+	}
+	return p.Addr()
+}
+
+// parseAddrOrPrefix parses "1.2.3.4" as a /32 prefix and "1.2.3.4/24" as
+// the full prefix. Hosts use bare addresses, local configs use a prefix so
+// the kernel installs the subnet route on the right interface.
+func parseAddrOrPrefix(v string) (netip.Prefix, error) {
+	if p, err := netip.ParsePrefix(v); err == nil {
+		return p, nil
+	}
+	a, err := netip.ParseAddr(v)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	return netip.PrefixFrom(a, a.BitLen()), nil
 }
 
 func firstNonEmpty(entries config.Entries, keys ...string) string {
@@ -302,6 +346,12 @@ func (d *Daemon) announceLocal() error {
 	}
 	if ep := d.endpoint.Get(); ep.IsValid() {
 		hello.Endpoint = ep.String()
+	}
+	if l.InnerAddr.IsValid() {
+		hello.InnerAddr = l.InnerAddr.String()
+	}
+	if l.UnderlayAddr.IsValid() {
+		hello.UnderlayAddr = l.UnderlayAddr.String()
 	}
 	if err := d.plane.AnnounceHello(hello); err != nil {
 		return err
@@ -332,8 +382,9 @@ func (d *Daemon) buildState() dataplane.State {
 		VXLANInterface: l.VXLANIface,
 		VXLANID:        l.VXLANID,
 		VXLANPort:      l.VXLANPort,
-		LocalInnerAddr: l.InnerAddr,
-		MTU:            l.MTU,
+		LocalInnerAddr:    l.InnerAddr,
+		LocalUnderlayAddr: l.UnderlayAddr,
+		MTU:               l.MTU,
 	}
 	for _, peer := range d.g.Nodes() {
 		if peer == l.NodeName {
@@ -371,32 +422,40 @@ func (d *Daemon) buildState() dataplane.State {
 				}
 			}
 		}
-		var inner netip.Addr
-		if v, ok := hostEntries.GetFirst("InnerAddress"); ok {
-			if parsed, err := netip.ParseAddr(v); err == nil {
-				inner = parsed
-			}
+		// Address precedence (mirrors Endpoint): gossip-learned > hosts/<peer>.
+		// Gossip is the source of truth once a Hello has arrived; hosts/ is the
+		// pre-gossip fallback (e.g. peer not yet reachable, or addresses set
+		// out-of-band via export/import).
+		inner := d.plane.InnerAddrOf(peer)
+		if !inner.IsValid() {
+			inner = addrFromHostEntry(hostEntries, "InnerAddress")
 		}
-		allowed := d.allowedIPsFor(l.Mode, peer, inner)
+		underlay := d.plane.UnderlayAddrOf(peer)
+		if !underlay.IsValid() {
+			underlay = addrFromHostEntry(hostEntries, "UnderlayAddress")
+		}
+		allowed := d.allowedIPsFor(l.Mode, peer, underlay)
 		state.Peers = append(state.Peers, dataplane.Peer{
-			Name:       peer,
-			WGPublic:   wgPub,
-			Endpoint:   ep,
-			InnerAddr:  inner,
-			AllowedIPs: allowed,
+			Name:         peer,
+			WGPublic:     wgPub,
+			Endpoint:     ep,
+			InnerAddr:    inner,
+			UnderlayAddr: underlay,
+			AllowedIPs:   allowed,
 		})
 	}
 	return state
 }
 
 // allowedIPsFor returns the AllowedIPs to install on a WireGuard peer entry.
-// In switch/hub mode this is just the peer's inner VXLAN address; in router
-// mode it expands to all subnets the peer owns in the gossip graph (so the
-// kernel will route their traffic to this WG peer).
-func (d *Daemon) allowedIPsFor(mode dataplane.Mode, peer string, inner netip.Addr) []netip.Prefix {
+// In switch/hub mode this is just the peer's underlay address (so WG carries
+// the VXLAN outer UDP-4789 packets); in router mode it expands to all
+// subnets the peer owns in the gossip graph (so the kernel will route their
+// L3 traffic to this WG peer).
+func (d *Daemon) allowedIPsFor(mode dataplane.Mode, peer string, underlay netip.Addr) []netip.Prefix {
 	if mode != dataplane.ModeRouter {
-		if inner.IsValid() {
-			return []netip.Prefix{netip.PrefixFrom(inner, inner.BitLen())}
+		if underlay.IsValid() {
+			return []netip.Prefix{netip.PrefixFrom(underlay, underlay.BitLen())}
 		}
 		return nil
 	}

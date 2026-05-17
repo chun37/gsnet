@@ -64,11 +64,18 @@ func (e Envelope) SigningBytes() []byte {
 //
 // Ed25519Public is the raw 32-byte public key (not PEM, not base64) so it
 // can be used directly for envelope verification.
+//
+// InnerAddr / UnderlayAddr carry the originator's overlay (VXLAN) and
+// WireGuard underlay addresses so peers can install matching FDB entries
+// and WG AllowedIPs without an out-of-band copy of hosts/<peer>. Each is
+// either a bare address ("10.42.0.1") or a CIDR prefix ("10.42.0.1/24").
 type Hello struct {
 	Name          string `json:"name"`
 	Ed25519Public []byte `json:"ed25519_pub"`
 	WGPublic      string `json:"wg_pub"`
-	Endpoint      string `json:"endpoint,omitempty"` // host:port if known
+	Endpoint      string `json:"endpoint,omitempty"`      // host:port if known
+	InnerAddr     string `json:"inner_addr,omitempty"`    // overlay addr (VXLAN), bare or CIDR
+	UnderlayAddr  string `json:"underlay_addr,omitempty"` // WG-underlay addr, bare or CIDR
 }
 
 type AddEdge struct {

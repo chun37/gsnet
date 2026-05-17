@@ -15,11 +15,12 @@ import (
 
 // Peer describes one remote node from the data-plane's point of view.
 type Peer struct {
-	Name       string
-	WGPublic   wgtypes.Key
-	Endpoint   netip.AddrPort // best-known outer endpoint; zero value = unknown
-	InnerAddr  netip.Addr     // peer's address on the VXLAN overlay (for unicast head-end replication)
-	AllowedIPs []netip.Prefix // WG AllowedIPs (typically the peer's inner address as /32 or /128)
+	Name         string
+	WGPublic     wgtypes.Key
+	Endpoint     netip.AddrPort // best-known outer endpoint; zero value = unknown
+	InnerAddr    netip.Addr     // peer's overlay address (assigned to the VXLAN device on the peer)
+	UnderlayAddr netip.Addr     // peer's WG-underlay address (FDB destination + WG AllowedIPs)
+	AllowedIPs   []netip.Prefix // WG AllowedIPs (typically the peer's underlay address as /32 or /128)
 }
 
 // Mode determines how the data plane forwards packets.
@@ -58,8 +59,15 @@ type State struct {
 	VXLANInterface string
 	VXLANID        uint32
 	VXLANPort      uint16
-	LocalInnerAddr netip.Addr // local end of the VXLAN overlay
-	MTU            int
+	// LocalInnerAddr is this node's address on the VXLAN overlay
+	// (assigned to the VXLAN device, with mask for subnet route).
+	LocalInnerAddr netip.Prefix
+	// LocalUnderlayAddr is this node's WG-underlay address (assigned to
+	// the WireGuard interface, used as the VXLAN encap source IP and as
+	// the destination peers reach via WG AllowedIPs). Required in
+	// switch/hub mode to break the VXLAN-over-WG routing loop.
+	LocalUnderlayAddr netip.Prefix
+	MTU               int
 
 	// Remote peers
 	Peers []Peer
